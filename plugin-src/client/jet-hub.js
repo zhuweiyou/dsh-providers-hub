@@ -4731,7 +4731,7 @@ function ProviderPanel({ provider, rpcCall }) {
                     React.createElement('p', null,
                       '尚未添加账号。免费模型无需账号即可使用；添加自己的 API key 可启用付费模型，并为每个账号配置独立出口。'),
                     React.createElement('p', { className: 'dim-jh-hint' },
-                      'API key 在 opencode.ai/auth 生成，形如 sk-…'))
+                      'API key 在 opencode.ai/console/account 生成（旧 key 形如 sk-…，新 key 形如 oc_sk_…）'))
                 : React.createElement('div', null,
                     React.createElement('p', null, '尚未配置账号'),
                     React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。')))

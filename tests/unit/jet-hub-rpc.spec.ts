@@ -11,8 +11,11 @@ import {
   collectCreditBalances,
   collectCreditsStatus,
   computeClaimSummary,
+  DEFAULT_CREDITS_STATUS_CONCURRENCY,
   JET_HUB_API_PATH,
+  MAX_CREDITS_STATUS_CONCURRENCY,
   registerJetHubRpc,
+  resolveCreditsStatusConcurrency,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
@@ -251,6 +254,34 @@ function makeDeps(overrides: Partial<CreditsEndpointDeps> = {}): CreditsEndpoint
   }
 }
 
+describe('★ credits.status 的并发度解析（2026-10-22）', () => {
+  it('默认 3；`1` 恢复串行；非正整数一律回落默认', () => {
+    expect(DEFAULT_CREDITS_STATUS_CONCURRENCY).toBe(3)
+    expect(resolveCreditsStatusConcurrency(undefined, 10)).toBe(3)
+    expect(resolveCreditsStatusConcurrency(1, 10), '1 = 恢复旧的完全串行语义').toBe(1)
+    expect(resolveCreditsStatusConcurrency(4, 10)).toBe(4)
+    // ⚠️ 逐格：这些都不是「正整数」⇒ 回落默认（`0` 也是回落，**不是**串行）。
+    for (const bad of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY, '3', null, true]) {
+      expect(resolveCreditsStatusConcurrency(bad, 10), `${String(bad)} 应回落默认`).toBe(3)
+    }
+  })
+
+  it('★ 硬上界：`1e10` / `MAX_SAFE_INTEGER` 不得变成「全池并发」', () => {
+    // ⚠️⚠️ 初版上界是 `accounts.length` ⇒ `concurrency: 1e10` 时并发度 = 账号数
+    //    ⇒ 实测 31 个账号 = **31 个并发请求打同一上游**。本用例锁住硬顶。
+    expect(MAX_CREDITS_STATUS_CONCURRENCY).toBe(8)
+    expect(resolveCreditsStatusConcurrency(1e10, 31)).toBe(MAX_CREDITS_STATUS_CONCURRENCY)
+    expect(resolveCreditsStatusConcurrency(Number.MAX_SAFE_INTEGER, 31)).toBe(MAX_CREDITS_STATUS_CONCURRENCY)
+  })
+
+  it('账号数少于并发度时取账号数；0 个账号取 1（不能是 0）', () => {
+    expect(resolveCreditsStatusConcurrency(undefined, 2)).toBe(2)
+    // ⚠️ 0 会让 `Array.from({length: 0})` ⇒ `Promise.all([])` 立即 resolve
+    //    ⇒ `results` 保持全空洞。故下限是 1。
+    expect(resolveCreditsStatusConcurrency(undefined, 0)).toBe(1)
+  })
+})
+
 describe('credits.status 单账号异常隔离', () => {
   it('非法 credentialRef 只让该账号状态为 null，其余账号仍被查询', async () => {
     const accounts = [
@@ -279,13 +310,18 @@ describe('credits.status 单账号异常隔离', () => {
   })
 
   it('resolve 抛错只让该账号状态为 null，其余账号仍被查询', async () => {
-    const accounts = [makeEntry({ id: 'boom' }), makeEntry({ id: 'ok' })]
+    // ⚠️ 判据必须按**账号身份**（ref 名），不能按调用序号：`collectCreditsStatus`
+    //    已改为有限并发（默认 3），「第 N 次调用」与「第 N 个账号」不再同构。
+    const accounts = [
+      makeEntry({ id: 'boom', credentialRef: 'LOBSTERAI_ACCOUNT_AAAA_BOOM' }),
+      makeEntry({ id: 'ok' }),
+    ]
     let resolveCalls = 0
     const deps = makeDeps({
-      resolve: async () => {
+      resolve: async (ref) => {
         resolveCalls++
-        // 第一个账号的 resolve 抛错（如凭据已被外部删除）；后续账号正常。
-        if (resolveCalls === 1) throw new Error('凭据已被外部删除')
+        // boom 的 resolve 抛错（如凭据已被外部删除）；其余账号正常。
+        if (String(ref).endsWith('BOOM')) throw new Error('凭据已被外部删除')
         return { value: VALID_CREDENTIAL_JSON }
       },
     })
@@ -293,19 +329,50 @@ describe('credits.status 单账号异常隔离', () => {
     const results = await collectCreditsStatus(accounts, LOBSTERAI, deps)
 
     expect(results.map(r => r.accountId)).toEqual(['boom', 'ok'])
-    expect(results[0]?.status).toBeNull()
+    expect(results[0]?.status, 'boom 的凭据解析失败只影响它自己').toBeNull()
     expect(results[1]?.status).toEqual(makeStatus())
     expect(resolveCalls).toBe(2)
   })
 
   it('JSON 损坏与网络失败都只影响该账号', async () => {
-    const accounts = [makeEntry({ id: 'corrupt' }), makeEntry({ id: 'network-down' }), makeEntry({ id: 'ok' })]
-    let resolveCalls = 0
+    const accounts = [
+      makeEntry({ id: 'corrupt', credentialRef: 'LOBSTERAI_ACCOUNT_AAAA_CORRUPT' }),
+      makeEntry({ id: 'network-down', credentialRef: 'LOBSTERAI_ACCOUNT_AAAA_NETDOWN' }),
+      makeEntry({ id: 'ok', credentialRef: 'LOBSTERAI_ACCOUNT_AAAA_OK' }),
+    ]
+    /**
+     * ⚠️⚠️ **判据必须按账号身份，不能按调用序号**（**语义变更登记**）。
+     *
+     * 初版用「跨账号共享的可变计数器」区分账号：
+     * ```ts
+     * let resolveCalls = 0
+     * resolve: async () => ({ value: resolveCalls++ === 0 ? '{ not json' : VALID })
+     * fetchStatus: async () => { if (resolveCalls === 2) throw … }
+     * ```
+     * 串行时「第 2 个账号」==「`resolveCalls === 2`」，两者**恰好同构**；
+     * `collectCreditsStatus` 改成有限并发（默认 3）后，`resolveCalls` 的递增顺序
+     * 与**账号下标**解耦 ⇒ 判据打空 ⇒ 本用例变红。
+     *
+     * ⇒ 改法是**把判据挪到账号身份上**（ref 名 / 凭据里的 `id`），它才是本用例
+     * 真正想表达的语义（「这个账号坏了」而不是「第 2 次调用坏了」），且与并发度无关。
+     * 「每个账号都真的被处理了」由下面单独的 `★ 并发下…` 用例守。
+     */
     const deps = makeDeps({
-      resolve: async () => ({ value: resolveCalls++ === 0 ? '{ not json' : VALID_CREDENTIAL_JSON }),
-      // 第二个账号（network-down）的状态请求抛网络错误
-      fetchStatus: async () => {
-        if (resolveCalls === 2) throw new Error('socket hang up')
+      resolve: async (ref) => {
+        // 按 **ref 名字**判「这是哪个账号」，而不是按调用序号。
+        const name = String(ref)
+        if (name.endsWith('CORRUPT')) return { value: '{ not json' }
+        // `network-down` 的凭据里带一个标记，供 `fetchStatus` 认出它。
+        if (name.endsWith('NETDOWN')) {
+          return { value: JSON.stringify({ ...JSON.parse(VALID_CREDENTIAL_JSON), id: 'network-down' }) }
+        }
+        return { value: VALID_CREDENTIAL_JSON }
+      },
+      fetchStatus: async (credential) => {
+        // `network-down` 的状态请求抛网络错误（凭据里的 `id` 就是它的身份）。
+        if ((credential as { id?: string } | undefined)?.id === 'network-down') {
+          throw new Error('socket hang up')
+        }
         return makeStatus()
       },
     })
@@ -313,9 +380,57 @@ describe('credits.status 单账号异常隔离', () => {
     const results = await collectCreditsStatus(accounts, LOBSTERAI, deps)
 
     expect(results.map(r => r.accountId)).toEqual(['corrupt', 'network-down', 'ok'])
-    expect(results[0]?.status).toBeNull()
-    expect(results[1]?.status).toBeNull()
+    expect(results[0]?.status, 'JSON 损坏只影响它自己').toBeNull()
+    expect(results[1]?.status, '网络失败只影响它自己').toBeNull()
     expect(results[2]?.status).toEqual(makeStatus())
+  })
+
+  it('★ 并发下每个账号都被处理一次，且结果按原序（不依赖调用序）', async () => {
+    // 断言「每个账号恰好被处理一次」与「结果顺序 = 输入顺序」，两者都与并发度
+    // 无关 ⇒ 并发度调成 1 或 8 都绿。
+    const accounts = Array.from({ length: 9 }, (_, index) => makeEntry({
+      id: `acc-${index}`,
+      // ⚠️ 每个账号**不同的 ref**：`resolve` 靠它区分身份。
+      credentialRef: `LOBSTERAI_ACCOUNT_AAAA_ACC${index}`,
+    }))
+    const seen: string[] = []
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, makeDeps({
+      resolve: async (ref) => {
+        const name = String(ref)
+        const index = name.slice(name.lastIndexOf('ACC') + 3)
+        return { value: JSON.stringify({ ...JSON.parse(VALID_CREDENTIAL_JSON), id: `acc-${index}` }) }
+      },
+      fetchStatus: async (credential) => {
+        seen.push((credential as { id?: string }).id ?? '?')
+        await new Promise(resolve => setTimeout(resolve, 5))
+        return makeStatus()
+      },
+    }))
+    expect(results.map(r => r.accountId), '结果必须按 accounts 原序').toEqual(accounts.map(a => a.id))
+    expect([...seen].sort(), '每个账号恰好处理一次，不得重复也不得漏').toEqual(accounts.map(a => a.id).sort())
+  })
+
+  it('★ 账号对象的 getter 抛错 / deps.warn 抛错都不得让整批失败', async () => {
+    // ⚠️ 初版把 `entry.id` / `entry.nickname` 的读取放在 catch **之后**那行
+    //    ⇒ 带 getter 的 entry 一抛错就让 worker reject ⇒ `Promise.all` 短路 ⇒
+    //    整批 `handler-failed`。`deps.warn` 在 catch 里抛错同样逃逸。
+    const poisoned = {
+      id: 'poisoned',
+      provider: 'lobsterai',
+      get nickname(): string { throw new Error('getter 炸了') },
+      enabled: true,
+      credentialRef: 'LOBSTERAI_ACCOUNT_AAAA1111',
+      createdAt: 1,
+      refreshable: true,
+    } as unknown as ProviderAccountEntry
+    const accounts = [poisoned, makeEntry({ id: 'ok' })]
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, makeDeps({
+      warn: () => { throw new Error('告警出口也炸了') },
+    }))
+
+    expect(results.map(r => r.accountId), 'getter 抛错不得让整批失败').toEqual(['poisoned', 'ok'])
+    expect(results[0]?.status).toBeNull()
+    expect(results[1]?.status, '后一个账号仍被正常处理').toEqual(makeStatus())
   })
 
   it('停用账号同样处理（停用与签到无关），异常出口收到告警', async () => {

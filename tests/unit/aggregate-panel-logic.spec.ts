@@ -1503,8 +1503,6 @@ describe('★★ 按临期重探定时器（第 5 条判据，此前零覆盖）
     const panelCodeOnly = panel
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/^[ \t]*\/\/.*$/gm, '')
-    const readme = readFileSync(resolve(here, '../..', 'README.md'), 'utf8')
-
     /** 枚举一段文本里所有「每 N 分钟」并逐个核对（返回出现次数）。 */
     const assertAllMention = (text, label) => {
       const found = [...text.matchAll(/每\s*(\d+)\s*分钟/g)].map((x) => x[0])
@@ -1516,16 +1514,18 @@ describe('★★ 按临期重探定时器（第 5 条判据，此前零覆盖）
     }
 
     const panelHits = assertAllMention(panelCodeOnly, 'jet-hub.js')
-    const readmeHits = assertAllMention(readme, 'README.md')
-    // ⚠️ **判据自检**：两处都必须**真的复述**过（否则本条退化成恒真 ——
+    // ⚠️ **判据自检**：必须**真的复述**过（否则本条退化成恒真 ——
     //    把文案全删光也会通过）。这也是原实现缺的那半：它只 `toContain` 一次。
-    // ⚠️ 阈值按**实测**给（2026-10-16 核实：`jet-hub.js` 2 处 = 工具行按钮的 title
-    //    各一句；README 2 处 = 表格一列 + 说明段）。别把它写成「越多越好」——
-    //    那会在合理删减文案时假失败；只要 ≥2/≥1 就足以证伪「一句都没有」。
+    // ⚠️ 阈值按**实测**给（2026-10-16 核实：`jet-hub.js` 2 处 = 工具行按钮的
+    //    title 各一句）。别把它写成「越多越好」—— 那会在合理删减文案时假失败；
+    //    只要 ≥2 就足以证伪「一句都没有」。
+    // ⚠️⚠️ **README 不参与本判据**（2026-10-22 删除）：原实现还断言
+    //    `readmeHits >= 1`（「README 必须复述间隔」）。README 已精简为上手页，
+    //    不再复述面板节奏 ⇒ 一个纯 UI 判据却依赖文档措辞：改文档就能让守卫
+    //    变绿、文档微调就又假红。与「判据打在行为上」相悖，故移除。
     expect(panelHits, '★ jet-hub.js 必须复述间隔（至少两处：工具行 title 与说明）')
       .toBeGreaterThanOrEqual(2)
-    expect(readmeHits, '★ README 必须复述间隔').toBeGreaterThanOrEqual(1)
-    // ⚠️ 若将来改成非整分钟（如 90 秒），上面两条自检会因「枚举不到」而主动失败
+    // ⚠️ 若将来改成非整分钟（如 90 秒），上面的自检会因「枚举不到」而主动失败
     //    提醒改判据 —— 那是刻意的：复述文案在那种情况下必须重写成「每 N 秒」。
   })
 })

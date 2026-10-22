@@ -20,10 +20,14 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  EXPIRY_PROBE_BUDGET_MS,
+  EXPIRY_PROBE_MIN_SLICE_MS,
   WIRED_EXPIRY_PROVIDERS,
   codeArtsExpiry,
   createExpiryProbe,
+  expiryProbeSliceMs,
   lobsteraiExpiry,
+  normalizeExpiryProbeBudget,
   traeExpiry,
 } from '../../src/aggregate-expiry.js'
 import { NEVER, UNUSABLE } from '../../src/aggregate-core.js'
@@ -32,6 +36,63 @@ import { TRAE } from '../../src/trae-product.js'
 import { createProviderExpiry } from '../../src/provider-expiry.js'
 import { clearProviderRuntimes, registerProviderRuntime } from '../../src/provider-runtime.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+
+/**
+ * 造一个 pool：`listAvailableCredentials` 返回**给定数量**的账号。
+ *
+ * ⚠️⚠️ 本函数收的是**账号数**，而本文件各 describe 内部另有几个局部 `poolWith`/池字面量
+ * 收的是**凭据数组**。两者**不要混用**：2026-10-22 上游审计实测，把数字传给收数组的
+ * 那版会让 `7.map` 抛 `TypeError`，被外层 `catch` 吞成 `UNUSABLE` ⇒ **0 次 fetch、0 ms**
+ * ⇒ 预算用例**假绿**（断言「是 UNUSABLE」与「耗时 < 预算」全部满足，而预算代码一行没跑）。
+ * ⇒ 本函数刻意独立命名，不复用别处的池构造器。
+ */
+function poolOfAccounts(count: number): never {
+  return {
+    disabledModelsFor: () => new Set<string>(),
+    listAvailableCredentials: async () => Array.from({ length: count }, (_, index) => ({
+      entry: { id: `acc-${index}` },
+      credential: { access_token: `t${index}`, expires_at: '' },
+    })),
+    // ⚠️ 同时提供旧的单账号方法（回退路径用）—— 但本组断言**走的是新方法**。
+    getAvailableAccount: async () => {
+      throw new Error('不应走单账号回退路径')
+    },
+  } as never
+}
+
+/** 让 `fetch` **永远挂起**（只在收到 abort 时 reject）。 */
+function stubHangingFetch(): void {
+  vi.stubGlobal('fetch', ((_input: unknown, init?: { signal?: AbortSignal }) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const error = new Error('aborted')
+        error.name = 'AbortError'
+        reject(error)
+      })
+    })) as unknown as typeof fetch)
+}
+
+/**
+ * `lobsterai` 的**真实**报文形状（`parseLobsteraiEnvelope` → `data.creditItems[]`）。
+ *
+ * ⚠️⚠️ **不要**改成 `data.Response.Data.Accounts[]` —— 那是 `credits.ts` 的 buddy 形状。
+ * 用错形状时 `lobsteraiExpiry` 解析不到任何包 ⇒ 恒 `UNUSABLE` ⇒ 断言 `toBe(expiry)`
+ * 必红，且**红因是桩形状而不是被测逻辑**（上游 2026-10-22 审计实测）。
+ */
+function lobsteraiCreditsResponse(expiryMs: number): Response {
+  return new Response(JSON.stringify({
+    code: 0,
+    msg: 'ok',
+    data: {
+      creditItems: [{
+        type: 'campaign',
+        label: '每日登录奖励',
+        creditsRemaining: 100,
+        expiresAt: new Date(expiryMs).toISOString(),
+      }],
+    },
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+}
 
 /**
  * 把**真实的**临期折算实现挂进 runtime（本文件多处用例要验折算**值**）。
@@ -1010,5 +1071,176 @@ describe('★ clear() 必须挡住在途探测（陈旧值不得活过 clear）'
     const afterFirst = calls
     await probe('lobsterai')
     expect(calls, 'TTL 内应命中缓存').toBe(afterFirst)
+  })
+})
+
+/**
+ * ★★ 单渠道折算预算（移植上游 9ba4505 + 86e3591）。
+ *
+ * ## 三条自证纪律（上游初版三条用例全踩了，逐条记下来）
+ *
+ * 1. **桩必须真的存在**：上游初版调了一个全仓不存在的 `stubFetchHangs()` ⇒ 三条用例
+ *    全部 `ReferenceError` ⇒ **从未运行过**。本组把桩定义在**文件作用域**。
+ * 2. **`poolOfAccounts(n)` 的入参必须是「账号数」**，不能复用具名字面量（见该函数注释）。
+ * 3. **fetch 桩的报文形状必须是被测渠道真实消费的那个**（见 `lobsteraiCreditsResponse`）。
+ *
+ * ## 为什么本组大多把 `budgetMs` 显式调小
+ *
+ * 默认预算是 8 秒。若每条用例都等 8 秒，本文件会从 3 秒涨到 30 秒以上，而
+ * `pnpm test` 的约定是「快速、无网络」。⇒ 凡是**能等价验证**的都用
+ * `budgetMs: 2_000`（2 个账号时均分 1000 < 下限 1500 ⇒ 每号 1500ms，行为与默认值同构）。
+ * 只有「归一化是否真的接上了」必须用默认 8 秒——但也不必等它跑完（见那条用例）。
+ *
+ * ## 为什么用真实时钟
+ *
+ * `vi.useFakeTimers()` 会让「计时器没保持事件循环活跃」这条缺陷测不出来
+ * （`withinBudget` 的注释记着：`unref()` 会让进程静默退出）。
+ */
+describe('★★ 单渠道折算预算与 budgetMs 归一化', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  const anyModel = async (): Promise<string | undefined> => 'deepseek-v4.1-flash'
+
+  it('EXPIRY_PROBE_BUDGET_MS = 8 秒；下限 1.5 秒 < 预算', () => {
+    expect(EXPIRY_PROBE_BUDGET_MS).toBe(8_000)
+    expect(EXPIRY_PROBE_MIN_SLICE_MS).toBe(1_500)
+    // ⚠️ 下限必须小于预算，否则「一个账号都不止一份」时总时长必然超预算。
+    expect(EXPIRY_PROBE_MIN_SLICE_MS).toBeLessThan(EXPIRY_PROBE_BUDGET_MS)
+  })
+
+  it('★ normalizeExpiryProbeBudget：只有有限非负数被采纳（`Infinity` 回落默认）', () => {
+    // ⚠️ 这张表是**行为判据**，不是常量自证：初版只判 `=== 0`，于是 `Infinity`
+    //    （「不封顶」最自然的直觉写法）会让 `setTimeout` 溢出被钳成 1 ms ⇒
+    //    全部渠道瞬间 UNUSABLE（上游实测）。逐格断言防它回来。
+    expect(normalizeExpiryProbeBudget(undefined)).toBe(EXPIRY_PROBE_BUDGET_MS)
+    expect(normalizeExpiryProbeBudget(0), '0 = 不封顶，是唯一登记的写法').toBe(0)
+    expect(normalizeExpiryProbeBudget(-1), '负数 ⇒ 回落默认（否则 deadline 在过去、0 次 fetch）')
+      .toBe(EXPIRY_PROBE_BUDGET_MS)
+    expect(normalizeExpiryProbeBudget(Number.POSITIVE_INFINITY), 'Infinity ⇒ 回落默认')
+      .toBe(EXPIRY_PROBE_BUDGET_MS)
+    expect(normalizeExpiryProbeBudget(Number.NaN)).toBe(EXPIRY_PROBE_BUDGET_MS)
+    expect(normalizeExpiryProbeBudget('0'), '字符串不是数字').toBe(EXPIRY_PROBE_BUDGET_MS)
+    expect(normalizeExpiryProbeBudget(8_000)).toBe(8_000)
+    // ⚠️ 上界是 `setTimeout` 自己的上限：超过它 Node 会钳成 1 ms ⇒ 必须在这里截断。
+    expect(normalizeExpiryProbeBudget(1e10)).toBe(2 ** 31 - 1)
+  })
+
+  it('★★ expiryProbeSliceMs：`min(剩余预算, max(下限, 均分))` —— 逐格算术，与时钟无关', () => {
+    // ⚠️ 本用例替代一条**无牙**的耗时断言（上游变异验证实测）：去掉
+    //    `min(剩余预算, …)` 只让 31 个账号的耗时从 8.01 s 变成 9.05 s，而
+    //    **探测账号数完全相同** ⇒ 耗时断言要么无牙、要么时红时绿。
+    //    抽成纯函数后判据是确定性的。
+    expect(expiryProbeSliceMs(8_000, 8_000, 31), '均分 258 < 下限 ⇒ 取下限').toBe(1_500)
+    expect(expiryProbeSliceMs(8_000, 8_000, 3)).toBe(2_666)
+    expect(expiryProbeSliceMs(8_000, 8_000, 2)).toBe(4_000)
+    expect(expiryProbeSliceMs(8_000, 8_000, 1)).toBe(8_000)
+    // ★ 下限**不得透支预算**：剩余 300 < 下限 1500 ⇒ 取 300。
+    //   没有 `min` 时会给 1500 ⇒ 每个账号都能「续命」超出预算
+    //   （上游第一版实测 31 × 1.5 = 46.8 s）。
+    expect(expiryProbeSliceMs(8_000, 300, 5), '剩余 300 < 下限 ⇒ 取剩余').toBe(300)
+    expect(expiryProbeSliceMs(8_000, 100, 20)).toBe(100)
+    expect(expiryProbeSliceMs(8_000, -5, 3)).toBeLessThanOrEqual(0)
+    // `budgetMs: 0`（不封顶）⇒ 恒 Infinity，与剩余/账号数无关。
+    expect(expiryProbeSliceMs(0, 0, 31)).toBe(Number.POSITIVE_INFINITY)
+    expect(expiryProbeSliceMs(0, -999, 1)).toBe(Number.POSITIVE_INFINITY)
+    expect(Number.isNaN(expiryProbeSliceMs(8_000, Number.POSITIVE_INFINITY, 4))).toBe(false)
+  })
+
+  it('★★ 7 个账号全部挂死 ⇒ 在预算附近收工，不是 7×30s', async () => {
+    stubHangingFetch()
+    const probe = createExpiryProbe(poolOfAccounts(7), anyModel, { budgetMs: 2_000 })
+    const startedAt = Date.now()
+    const value = await probe('lobsterai')
+    const elapsed = Date.now() - startedAt
+
+    expect(value, '全部账号都查不到 ⇒ 必须剔除，不能判成「可用但不临期」').toBe(UNUSABLE)
+    expect(value, '绝不能是 NEVER（Infinity）—— 那会被排序当成永久可用').not.toBe(NEVER)
+    // 上界留足余量（CI 抖动）；下界只需证明它不是 7 × 30 s。
+    expect(elapsed, '预算必须封顶').toBeLessThan(2_000 + 2_000)
+  })
+
+  it('★★ 首号慢（> 单份预算）+ 次号快且成功 ⇒ **渠道必须保住**（初版会判 UNUSABLE）', async () => {
+    // ⚠️⚠️ 本组**最有价值**的一条：初版「首号吃满预算就 break」的实测后果是
+    //    「可用渠道被判死 + 缓存 60 秒 + 每轮同一个首号 ⇒ 永久不可见」。
+    const expiry = Date.now() + 86_400_000
+    let call = 0
+    vi.stubGlobal('fetch', ((_input: unknown, init?: { signal?: AbortSignal }) => {
+      call += 1
+      if (call === 1) {
+        return new Promise((_resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('上游慢失败')), 12_000)
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer)
+            const error = new Error('aborted')
+            error.name = 'AbortError'
+            reject(error)
+          })
+        })
+      }
+      return Promise.resolve(lobsteraiCreditsResponse(expiry))
+    }) as unknown as typeof fetch)
+
+    const probe = createExpiryProbe(poolOfAccounts(2), anyModel, { budgetMs: 2_000 })
+    const value = await probe('lobsterai')
+    expect(
+      value,
+      '首号慢不得让整渠道被判 UNUSABLE —— 次号明明可用（初版缺陷：break 掉后次号一次都没被问）',
+    ).toBe(expiry)
+  })
+
+  it('★★ `budgetMs: Infinity` 必须回落默认 8 秒（不得被 setTimeout 钳成 1ms）', async () => {
+    // ⚠️⚠️ 这条守的是**归一化被真的接上了**，不是 `normalizeExpiryProbeBudget` 本身
+    //    （那个由上面那条纯函数用例守）。
+    //    为什么 `Infinity` 最危险：它是最像「不封顶」的直觉写法，而
+    //    `setTimeout(fn, Infinity)` 会被 Node 钳成 **1 ms** ⇒ 每个账号瞬间
+    //    UNUSABLE ⇒ 全部渠道不可见，且**零报错**。
+    //
+    // ⚠️ 不必等满 8 秒：只需证明「1.5 秒时它还在跑」，然后用 abort 收尾。
+    //    若未归一化，它会在 ~1 ms 内就结束。
+    stubHangingFetch()
+    const probe = createExpiryProbe(poolOfAccounts(1), anyModel, {
+      budgetMs: Number.POSITIVE_INFINITY,
+    })
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const pending = probe('lobsterai', controller.signal)
+    const early = await Promise.race([
+      pending.then(() => 'done' as const, () => 'rejected' as const),
+      new Promise<'still-running'>((resolve) => {
+        setTimeout(() => resolve('still-running'), EXPIRY_PROBE_MIN_SLICE_MS)
+      }),
+    ])
+    expect(
+      early,
+      'Infinity 若未归一化，setTimeout 被钳成 1ms ⇒ 1.5 秒时早就结束了',
+    ).toBe('still-running')
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(EXPIRY_PROBE_MIN_SLICE_MS)
+  })
+
+  it('★★ 在 await 期间取消 ⇒ 立刻抛 AbortError，且**不写缓存**（既有缺陷回归）', async () => {
+    // ⚠️ 这是**既有缺陷**（非本 PR 引入，但修法落在 `withinBudget` 里）：
+    //    `credentialExpiry` 的签名没有 `signal`，各 `*Expiry` 用自己的 30 s 超时
+    //    ⇒ 取消发生在 await 期间时，循环顶部的 `throwIfAborted()` 与 catch 里的两条
+    //    **都看不到它** ⇒ 等满超时后返回 `UNUSABLE` 并缓存 60 秒
+    //    （用户取消一次 = 渠道消失 60 秒）。
+    stubHangingFetch()
+    const probe = createExpiryProbe(poolOfAccounts(1), anyModel)
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const startedAt = Date.now()
+    await expect(probe('lobsterai', controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(Date.now() - startedAt, '取消必须在毫秒级生效，不得等满上游超时').toBeLessThan(2_000)
+
+    // ⚠️ 中止不得留下缓存条目：后续（未中止的）调用必须**重新**探测。
+    let refetched = 0
+    vi.stubGlobal('fetch', (() => {
+      refetched += 1
+      return Promise.resolve(lobsteraiCreditsResponse(Date.now() + 86_400_000))
+    }) as unknown as typeof fetch)
+    const value = await probe('lobsterai')
+    expect(refetched, '中止留下的 UNUSABLE 若被缓存，这里会是 0 次请求').toBeGreaterThan(0)
+    expect(Number.isFinite(value), '取消后重探必须拿到真实观测值，不是缓存的 UNUSABLE').toBe(true)
   })
 })

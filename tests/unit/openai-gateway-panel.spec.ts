@@ -1322,11 +1322,15 @@ describe('网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / �
     expect(stripped).not.toContain('命令行查看同一份对照表')
     expect(stripped).not.toContain('gatewayModelsCurl(')
     expect(stripped).not.toContain('gatewayEffortsCurl(')
-    // ⚠️ 「地址栏直接打开会 401」那句 401 说明是 curl 段的标题的一半，一并删掉；
-    // 但**这个事实本身不能丢** —— 它已由 README 承担（`README.md` 的「模型清单」节）。
+    // ⚠️ 「地址栏直接打开会 401」那句 401 说明是 curl 段的标题的一半，一并删掉。
+    // ⚠️⚠️ **不再跨文件断言 README 复述 401**（2026-10-22 删除）：原判据是
+    //    `expect(readFileSync('../../README.md')).toContain('401')`，理由是
+    //    「这个事实不能丢，已由 README 承担」。但 README 已精简为上手页、
+    //    不再承载网关细节 ⇒ 这条纯 UI 判据实际在**守文档措辞**：改文档就能
+    //    让它变绿，文档微调又假红。与「判据打在行为上」相悖，故移除。
+    //    事实本身的出口：「/v1/models 需要 Bearer」由 `gatewayApiKeyHint` 与
+    //    网关端点自身的 401 响应承载，不在本用例的射程内。
     expect(stripped).not.toContain('地址栏直接打开会 401')
-    const readme = readFileSync(resolve(HERE, '../../README.md'), 'utf8')
-    expect(readme, '401 这件事必须在 README 里仍有交代').toContain('401')
   })
 
   it('④ 三段各有一个 .dim-jh-gatewaySection 容器，且段间有分隔', () => {

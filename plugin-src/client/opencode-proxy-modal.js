@@ -406,7 +406,11 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
       mode === 'key'
         ? React.createElement(React.Fragment, null,
             React.createElement('p', { className: 'dim-jh-modalHint' },
-              '在 opencode.ai/auth 生成 API key（形如 sk-…）后粘贴到下方。'
+              // ⚠️ 前缀**两种都要提**：opencode 2026-10-22 起签发 `oc_sk_…`
+              // （Gitee IKPLRU），旧号手里仍是 `sk-…`；只写一种会让另一种的人
+              // 以为自己的 key 不对。生成地址也从旧的 `/auth` 更正到控制台账号页。
+              '在 opencode.ai/console/account 生成 API key 后粘贴到下方'
+              + '（旧 key 形如 sk-…，新 key 形如 oc_sk_…）。'
               + '可启用付费模型，并为每个账号单独设置出口代理。'),
             // ⚠️ 内容必须在 modalBody 里（flex:1; min-height:0; overflow-y:auto），
             // 否则弹窗内容会被裁掉（见 jet-hub.js 既有 modal 的注释）。
@@ -417,7 +421,7 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
                   className: 'dim-jh-input',
                   // ⚠️ password 类型：API key 是凭据，不该在屏幕上裸显。
                   type: 'password',
-                  placeholder: 'sk-…',
+                  placeholder: 'sk-… / oc_sk_…',
                   autoFocus: true,
                   // Enter 直接提交：粘贴 key 后最自然的动作就是回车。
                   onKeyDown: (e) => {

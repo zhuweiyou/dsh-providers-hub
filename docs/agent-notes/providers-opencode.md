@@ -720,3 +720,38 @@ models.dev 每个条目带 `provider.api`。实测（2026-10-17）按它分组�
 
 ⚠️ 这是 `isAbandonedOfficeAceLogin` 注释里记的同型事故（「20 次只有 10 次变红」）
 的**复发** —— 当年没被根治。教训：断言必须是**确定时刻**可驱动的。
+
+## ⚠️⚠️ Issue IKPLRU：key 形状闸**不得绑死前缀**（`sk-` → `oc_sk_`）
+
+**报障（2026-10-22）**：opencode 控制台新签发的 key 改成 `oc_sk_…`
+开头（官方文档 console/api 全文用 `Authorization: Bearer oc_sk_…`，示例
+`oc_sk_1a2b3c4d5e6f_…`），而 `src/opencode-rpc.ts` 的形状闸写的是 `^sk-…`
+⇒ **新 key 全部被拒**，报「API key 形状不对（应以 sk- 开头…）」，
+用户一个账号都加不进来。
+
+**判据落点**（见 `KEY_PATTERN`）：形状闸只筛「像不像粘贴过来的密钥串」——
+≥20 位、无空白、`[A-Za-z0-9_.-]`（覆盖 base64url 与本形态的
+`oc_sk_<hex>_<secret>`）。**旧 `sk-` key 必须继续可用**（存量用户手里就是它），
+所以也**不能**改成「只认 `oc_sk_`」。⚠️ 别再把任何具体前缀写回判据：
+前缀是上游会改的东西，这类静态假设**必然腐坏**（与「静态兜底表必然腐坏」同型）。
+
+**同批实测挖出的第二个缺陷（独立于 IKPLRU，已一并修）**：`slotNamesOf` 把 key
+尾段**原样**拼进 `credentialRef()`，而它的 `REF_PATTERN` 只认
+`[A-Za-z_][A-Za-z0-9_]*` ⇒ 尾段含 `-` 或 `.` 时**抛 TypeError**，用户看到
+`credential ref "OPENCODE_ACCOUNT_-D-E-F-G" must match /^[A-Za-z_][A-Za-z0-9_]*$/`
+这条与 key 毫无关系的报错，**账号写不进去**。
+
+```
+key = sk-<40×a>-d-e-f-g  ⇒  {"ok":false,"error":{"message":"credential ref \"OPENCODE_ACCOUNT_-D-E-F-G\" must match …"}}
+```
+
+⇒ 修法是**只在尾段不合法时**归一化（合法尾段的 ref 逐字节不变 ⇒ 存量账号引用不动），
+并追加 key 的短哈希 —— **纯字符替换会让 `…ab-cd` 与 `…ab_cd` 撞成同一个 ref**
+（后添加的账号覆盖前者凭据），用例锁死在「两个 ref 不相等」上。
+
+**同时更正的文案**：生成地址 `opencode.ai/auth`（已 302 到 `/console/login`）
+→ `opencode.ai/console/account`；面板提示与 placeholder 两种前缀都写
+（`sk-… / oc_sk_…`），只写一种会让另一种的用户以为自己的 key 不对。
+
+**守卫**：`tests/unit/opencode-rpc.spec.ts` 三条（`oc_sk_` 被接受 / 含 `-` 尾段不抛错 /
+ref 不撞车）、`tests/unit/opencode-client-panel.spec.ts` 两条文案断言。
