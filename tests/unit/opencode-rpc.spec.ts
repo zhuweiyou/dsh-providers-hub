@@ -108,20 +108,64 @@ describe('分派归属（真实事故 2026-10-02）', () => {
 })
 
 const VALID_KEY = `sk-${'a'.repeat(48)}`
+/**
+ * opencode 2026-10-22 起签发的新形态（Gitee **IKPLRU**）。
+ * ⚠️ 这个 fixture 的**判据必须是「被接受」**，不是「被拒绝」——
+ * 上游改前缀不是缺陷，插件的形状闸跟着它一起改才是。
+ */
+const OC_SK_KEY = `oc_sk_1a2b3c4d5e6f${'0'.repeat(24)}`
 
 describe('opencode.addAccount', () => {
   it('key 形状非法时拒绝且不写池', async () => {
     const { call, pool } = harness()
     const r = await call('opencode.addAccount', { apiKey: 'not-a-key' })
     expect(r.ok).toBe(false)
-    expect(r.error?.message).toContain('sk-')
+    // ⚠️ 断言**不再**点名某个前缀（`sk-`）——文案里点名就等于把判据绑回前缀。
+    expect(r.error?.message).toContain('形状不对')
     expect(pool.addAccount).not.toHaveBeenCalled()
   })
 
-  it('key 过短拒绝（sk- 后至少 20 位）', async () => {
+  it('key 过短拒绝（不足 20 位）', async () => {
     const { call, pool } = harness()
     expect((await call('opencode.addAccount', { apiKey: 'sk-short' })).ok).toBe(false)
     expect(pool.addAccount).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ IKPLRU：新形态 `oc_sk_` key 必须被接受（前缀判据不得绑死 sk-）', async () => {
+    const { call, pool, ctx } = harness()
+    const r = await call('opencode.addAccount', { apiKey: OC_SK_KEY, nickname: '新形态' })
+    expect(r.ok, `oc_sk_ key 被拒：${JSON.stringify(r)}`).toBe(true)
+    expect(ctx.credentials.set).toHaveBeenCalledTimes(1)
+    expect(pool.addAccount).toHaveBeenCalledTimes(1)
+    // 凭据里存的必须是原样 key（形状闸不得改动它）。
+    const value = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![1])
+    expect((JSON.parse(value) as { api_key: string }).api_key).toBe(OC_SK_KEY)
+  })
+
+  it('⚠️ 尾段含 `-` 的 key：credentialRef 不得抛错（ref 归一化到 POSIX 标识符）', async () => {
+    // 实测（2026-10-22）：旧实现把尾段原样拼进 ref，而 `credentialRef()`
+    // 只认 `[A-Za-z_][A-Za-z0-9_]*` ⇒ 抛 TypeError，用户看到的是
+    // `credential ref "…" must match …` 这条与 key 无关的报错、账号写不进去。
+    const { call, pool, ctx } = harness()
+    const key = `sk-${'a'.repeat(40)}-d-e-f-g`
+    const r = await call('opencode.addAccount', { apiKey: key })
+    expect(r.ok, `含短横线的 key 被拒：${JSON.stringify(r)}`).toBe(true)
+    const ref = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![0])
+    expect(ref).toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/)
+    expect(ref).toContain('OPENCODE_ACCOUNT_')
+    expect(pool.addAccount).toHaveBeenCalledTimes(1)
+  })
+
+  it('⚠️ ref 归一化不得让两条不同的 key 撞成同一个凭据引用', async () => {
+    // `…ab-cd` 与 `…ab_cd`：**纯字符替换**会让两者都变成 `…AB_CD` ⇒
+    // 后添加的账号覆盖前者的凭据。判据打在「两个 ref 不相等」上。
+    const { call, ctx } = harness()
+    const base = `sk-${'a'.repeat(40)}`
+    await call('opencode.addAccount', { apiKey: `${base}ab-cd` })
+    await call('opencode.addAccount', { apiKey: `${base}ab_cd` })
+    const calls = (ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls
+    expect(calls).toHaveLength(2)
+    expect(calls[0]![0]).not.toBe(calls[1]![0])
   })
 
   it('合法 key 写入凭据 + 账号池条目', async () => {

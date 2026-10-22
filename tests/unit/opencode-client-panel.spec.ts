@@ -115,12 +115,14 @@ describe('面板文案', () => {
   })
   it('⚠️ opencode 的新建是粘贴 key，不是浏览器登录（空态与创建流程都要改）', () => {
     expect(hub).toMatch(/opencode\.addAccount/)
-    expect(hub).toMatch(/opencode\.ai\/auth 生成，形如 sk-…/)
+    // ⚠️ 文案两种前缀都要提（IKPLRU：2026-10-22 起新 key 是 `oc_sk_…`，
+    // 旧号仍是 `sk-…`）；生成地址是控制台账号页，旧的 `/auth` 已 302 到登录页。
+    expect(hub).toMatch(/opencode\.ai\/console\/account 生成（旧 key 形如 sk-…，新 key 形如 oc_sk_…）/)
   })
   it('⚠️ 添加 key 走自绘弹窗：password 输入 + Enter 提交 + 错误留在弹窗内', () => {
     // 输入框在 modal 文件里（纯展示层），提交逻辑在 jet-hub.js（宿主交互）。
     expect(modal).toMatch(/type: 'password'/)
-    expect(modal).toMatch(/placeholder: 'sk-…'/)
+    expect(modal).toMatch(/placeholder: 'sk-… \/ oc_sk_…'/)
     expect(modal).toMatch(/e\.key === 'Enter'/)
     expect(hub).toMatch(/const \[keyModal, setKeyModal\] = React\.useState/)
     expect(hub).toMatch(/keyInputRef/)

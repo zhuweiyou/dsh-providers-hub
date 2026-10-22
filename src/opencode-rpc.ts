@@ -26,7 +26,7 @@
  */
 
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ProviderAccountEntry } from './types.js'
 import { OPENCODE } from './opencode-product.js'
@@ -143,13 +143,21 @@ export interface OpencodePoolLike {
 }
 
 /**
- * key 形状：`sk-` 前缀 + 至少 20 位。
+ * key 形状：**不绑定任何前缀**，只粗筛「像不像一个粘贴过来的密钥串」——
+ * 至少 20 位、无空白、URL-safe 令牌字符集（覆盖 base64url 与
+ * `oc_sk_1a2b3c4d5e6f_…` 这种带分隔符的形态）。
+ *
+ * ⚠️⚠️ 这里**曾经**写死 `^sk-…`。opencode 2026-10-22 起签发的 key 改成
+ * `oc_sk_` 开头（Gitee **IKPLRU**：新 key 被这道闸**全部**挡在门外，报
+ * 「应以 sk- 开头」，用户无法添加任何账号）。**前缀是上游会改的东西**，
+ * 判据只能落在与上游命名无关的共性上 ⇒ **不要把某个具体前缀写回来**
+ * （旧 `sk-` key 仍需可用，故也不能改成「只认 oc_sk_」）。
  *
  * ⚠️ 这只是**形状**校验（挡手滑/占位符），**不是**有效性验证：
  * 真 key 仍要等第一次真实请求才知道。形状校验的价值是让「明显没粘贴对」
  * 在入库前就被挡下，而不是等到发消息时才 401。
  */
-const KEY_PATTERN = /^sk-[A-Za-z0-9_-]{20,}$/
+const KEY_PATTERN = /^[A-Za-z0-9_.-]{20,}$/
 
 /** 出口 IP 查询（公开服务，仅用于「测试代理」按钮，不承载业务流量）。 */
 const EXIT_IP_URL = 'http://ip-api.com/json/?fields=status,query,country'
@@ -157,10 +165,28 @@ const EXIT_IP_URL = 'http://ip-api.com/json/?fields=status,query,country'
 /** 探测连接用的超时（测试按钮不能无限等）。 */
 const TEST_TIMEOUT_MS = 10_000
 
-/** 账号 id / credentialRef 由 key 尾段派生，使重复 key 落到同一账号。 */
+/**
+ * 账号 id / credentialRef 由 key 尾段派生，使重复 key 落到同一账号。
+ *
+ * ⚠️⚠️ **两段必须分开算**：`id` 允许 `-`（只是池里的字符串键），而
+ * `credentialRef` 走 `credentialRef()`，其 `REF_PATTERN` 只认
+ * `[A-Za-z_][A-Za-z0-9_]*` —— 尾段里只要有一个 `-` 或 `.`（base64url 的
+ * key 很常见，实测 `sk-…-d-e-f-g` 就命中），原本会**抛出 TypeError**，
+ * 用户看到的是 `credential ref "OPENCODE_ACCOUNT_-D-E-F-G" must match …`
+ * 这条与 key 毫无关系的报错，且账号**写不进去**（2026-10-22 复现）。
+ *
+ * ⇒ 归一化**只在尾段不合法时**发生：合法尾段的 ref 逐字节不变
+ * （存量账号的凭据引用不能被改动），不合法时才做字符替换，并追加 key 的
+ * 短哈希补足判重信息 —— 纯替换会让 `…ab-cd` 与 `…ab_cd` 撞成同一个 ref，
+ * 后添加的账号会**覆盖**前者的凭据。
+ */
 function slotNamesOf(apiKey: string): { id: string; refName: string } {
   const tail = apiKey.slice(-8)
-  return { id: `${OPENCODE.id}-${tail.toLowerCase()}`, refName: `OPENCODE_ACCOUNT_${tail.toUpperCase()}` }
+  const upper = tail.toUpperCase()
+  const refName = /^[A-Z0-9_]*$/.test(upper)
+    ? `OPENCODE_ACCOUNT_${upper}`
+    : `OPENCODE_ACCOUNT_${upper.replace(/[^A-Z0-9_]/g, '')}_${createHash('sha256').update(apiKey).digest('hex').slice(0, 8).toUpperCase()}`
+  return { id: `${OPENCODE.id}-${tail.toLowerCase()}`, refName }
 }
 
 /**
@@ -191,7 +217,7 @@ export async function handleOpencodeRpc(
               const req = call.payload as RpcOpencodeAddAccountRequest
               const apiKey = typeof req?.apiKey === 'string' ? req.apiKey.trim() : ''
               if (!KEY_PATTERN.test(apiKey)) {
-                return fail('API key 形状不对（应以 sk- 开头、至少 20 位；可在 https://opencode.ai/auth 生成）')
+                return fail('API Key 形状不对（应为 20 位以上、不含空格的密钥串；可在 https://opencode.ai/console/account 生成）')
               }
               const { id, refName } = slotNamesOf(apiKey)
               // ⚠️ 重复 key 必须**复用**同一账号：同 key 加两次会让用户误以为是

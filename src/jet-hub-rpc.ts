@@ -754,6 +754,16 @@ export interface CreditsEndpointDeps<
   resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
   /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
+  /**
+   * `collectCreditsStatus` 的**并发度**；默认 3。
+   *
+   * 只影响 `credits.status` 这一趟逐账号**查询**（见该函数的长注释）。
+   * `1` = 完全串行（升级前语义）；测试与将来调参用。
+   *
+   * ⚠️ **不影响签到领取**：`collectClaimResults`（写操作）仍是串行，
+   * 本字段在那边没有消费者。
+   */
+  concurrency?: number
   /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
   claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>
   /**
@@ -924,8 +934,61 @@ export interface CreditsEndpointDeps<
   fetcher?: typeof fetch
 }
 
+/** `credits.status` 的默认并发度（见 {@link resolveCreditsStatusConcurrency}）。 */
+export const DEFAULT_CREDITS_STATUS_CONCURRENCY = 3
+
 /**
- * 逐账号收集签到状态（顺序执行，避免并发触发风控）。
+ * `credits.status` 并发度的**硬上界**。
+ *
+ * ## 为什么需要硬上界（2026-10-22，上游 86e3591 的对抗审计结论）
+ *
+ * 初版把上界写成 `accounts.length`：
+ *
+ * ```ts
+ * Math.max(1, Math.min(deps.concurrency ?? 3, accounts.length || 1))
+ * ```
+ *
+ * 于是 `deps.concurrency = 1e10`（任何 ≥ 账号数的安全整数）⇒ 并发度 = 账号数
+ * ⇒ **31 个账号 = 31 个并发请求打同一上游**（实测峰值 31）。注释说的「3 个并发
+ * 压力很低」这个保护**只由 `accounts.length` 约束，没有任何硬顶**。
+ *
+ * ⇒ 上界改为本常量，同时给「将来有人把默认值调大」加一道闸。
+ *
+ * ⚠️ 取值 8：默认 3 是常态，8 是天花板。调它需要重新核对
+ * `fetchStatus` 各家的限流策略（见 {@link resolveCreditsStatusConcurrency} 的名单）。
+ */
+export const MAX_CREDITS_STATUS_CONCURRENCY = 8
+
+/**
+ * 解析 `credits.status` 的并发度（**纯函数，可直接单测**）。
+ *
+ * 逐格行为：
+ *
+ * | 传入 | 结果 | 说明 |
+ * |---|---|---|
+ * | `undefined` / `0` / `-1` / `NaN` / `1.5` / `Infinity` / 字符串 | 3 | 非「正整数」一律回落默认 |
+ * | `1` | 1 | 恢复旧的完全串行语义 |
+ * | `4` | 4 | |
+ * | `1e10` / `MAX_SAFE_INTEGER` | **8** | 被 {@link MAX_CREDITS_STATUS_CONCURRENCY} 硬顶 |
+ * | `accounts.length === 0` | 1 | 起 1 个 worker 立刻返回 -1（**不能**是 0 —— 那会让 `results` 全是空洞） |
+ *
+ * ⚠️ `concurrency: 0` 的语义是「**回落默认 3**」，**不是**「串行」——要串行请传 `1`。
+ */
+export function resolveCreditsStatusConcurrency(raw: unknown, accountCount: number): number {
+  const wanted = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0
+    ? raw
+    : DEFAULT_CREDITS_STATUS_CONCURRENCY
+  const capped = Math.min(wanted, MAX_CREDITS_STATUS_CONCURRENCY)
+  // ⚠️ `Math.max(1, …)` 不可省：账号数为 0 时 `Array.from({length: 0})` 会让
+  //    `Promise.all([])` 立即 resolve，`results` 保持全空洞。
+  return Math.max(1, Math.min(capped, accountCount || 1))
+}
+
+/**
+ * 逐账号收集签到状态（**有限并发**，默认 3；见函数体内的长注释）。
+ *
+ * ⚠️ **原实现是纯串行**，注释写「顺序执行，避免并发触发风控」。2026-10-22 改成
+ * 有限并发，理由与代价见函数体内那段注释 —— **别再照旧注释改回串行**。
  *
  * **包含已停用账号**：停用只影响账号池的自动选择与限流切换，不改变账号本身
  * 是否已签到。用户要看到的是「这个账号今天领了没」，因此这里不过滤 enabled。
@@ -950,26 +1013,90 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
         product as unknown as ProviderProduct,
         fetcher,
       ))
-  const results: RpcCreditsStatusResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
-  for (const entry of accounts) {
-    let status: CheckinStatus | null = null
-    try {
-      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
-        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+  /**
+   * **有限并发**（2026-10-22，移植自上游 9ca6c22 + 86e3591；真实故障驱动）。
+   *
+   * ## 为什么不再「完全串行」
+   *
+   * 原实现是纯顺序循环，注释写「避免并发触发风控」。但账号池随用户增删账号
+   * **线性增长**，而单账号上游超时是 30 s 级 ⇒ 单渠道耗时 = 账号数 × 单账号耗时
+   * ⇒ 「打开 Jet Hub 设置页」的等待被账号数线性放大（上游实测该机 workbuddy 7 号
+   * + buddy 8 号，credits.status 单趟 90 秒；同一时刻 `model.list` 只要毫秒级）。
+   *
+   * ## 为什么是 3，以及本仓库与上游的**事实差异**
+   *
+   * ⚠️ **不要照抄上游的论证**（它写的是「只有 minimax 两家、只读 GET」，那是
+   * 上游 fork 删掉 buddy 之后的事实）。本仓库实际注册
+   * `ProviderCredits.fetchStatus` 的是**四家**（见 `src/provider-credits.ts`）：
+   * `minimax` / `minimaxintl` / `buddy` / `workbuddy`。其中：
+   *
+   * - minimax 两家的取数走 `minimaxFetchWithRetry`，它**只重试传输错误**
+   *   （HTTP 429 原样失败）⇒ 3 并发撞限流只是 3 条同时失败，不会变重试风暴；
+   * - buddy 系的签到状态是 **POST**（`credits.ts` 的 `postJson`），但它是
+   *   **只读查询**端点（`activity status`），一次/账号、无副作用；
+   * - 签到（**写操作**）走的是 `collectClaimResults`，那里**仍是串行**，
+   *   本改动不碰它（`deps.concurrency` 在那边没有消费者）。
+   *
+   * ⇒ 3 的含义是「同一上游最多 3 个在飞的查询」。这是本仓库自己的判断，
+   * 不是上游结论的直接外推。
+   *
+   * ## 顺序与逃逸
+   *
+   * - 结果**按 `accounts` 原序**写回（`new Array(len)` + 下标），UI 不跳序；
+   * - 单账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都只影响它自己；
+   * - ⚠️ `deps.warn` 抛错**不得**逃逸成整批失败（初版会：它在 catch 里调用，
+   *   一抛就把 worker 的 promise reject 掉）⇒ 已包 try。
+   *
+   * ⚠️ 并发度可通过 `deps.concurrency` 覆盖（测试与将来调参用）；
+   *    `1` 即恢复旧的完全串行语义。上界是 {@link MAX_CREDITS_STATUS_CONCURRENCY}
+   *    （**不是** `accounts.length` —— 那会让 31 个账号变成 31 并发）。
+   */
+  const concurrency = resolveCreditsStatusConcurrency(deps.concurrency, accounts.length)
+  const results: RpcCreditsStatusResponse['accounts'] = new Array(accounts.length)
+  let cursor = 0
+  /** 取下一个待处理下标；无剩余返回 -1（同步自增，单线程下无需加锁）。 */
+  const take = (): number => (cursor < accounts.length ? cursor++ : -1)
+  const worker = async (): Promise<void> => {
+    for (let index = take(); index !== -1; index = take()) {
+      const entry = accounts[index] as ProviderAccountEntry
+      /**
+       * ⚠️ `accountId` / `nickname` 必须在 try **之内**取：`entry` 是外部对象，
+       * 可能是带 getter 的代理 / 冻结对象，读取本身会抛。初版把它们的读取放在
+       * `results[index] = …` 那一行 —— 而那一行在 catch **之后**、不受保护
+       * ⇒ 一次抛错就让 worker 的 promise reject ⇒ `Promise.all` 短路 ⇒
+       * **整批失败**（违背本函数的设计约定）。
+       * ⇒ 先取到局部变量并各自兜底，写结果那一行只做纯赋值。
+       */
+      let accountId: string | undefined
+      let nickname: string | undefined
+      let status: CheckinStatus | null = null
+      try {
+        accountId = entry.id
+        nickname = entry.nickname
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
+        if (resolved !== undefined) {
+          const credential = JSON.parse(resolved.value) as TCredential
+          status = await fetchStatus(credential, product)
+        }
+      } catch (error) {
+        // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号。
+        // ⚠️ `deps.warn` 自己抛错也**不得**逃逸（初版会让整批失败）——
+        //    告警是尽力而为，它坏了不该让用户看不到其余账号的签到状态。
+        status = null
+        try {
+          deps.warn?.(`[jet-hub] credits.status 账号 ${String(accountId ?? entry.id)} 失败: ${String(error)}`)
+        } catch {
+          // 告警失败只能静默：这里已经没有更外层的可观测通道了。
+        }
       }
-      if (resolved !== undefined) {
-        const credential = JSON.parse(resolved.value) as TCredential
-        status = await fetchStatus(credential, product)
-      }
-    } catch (error) {
-      // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
-      deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
-      status = null
+      // ⚠️ 纯赋值，不得再抛（`Promise.all` 会因 worker reject 而短路整批）。
+      results[index] = { accountId, nickname, status } as RpcCreditsStatusResponse['accounts'][number]
     }
-    results.push({ accountId: entry.id, nickname: entry.nickname, status })
   }
+  await Promise.all(Array.from({ length: concurrency }, worker))
   return results
 }
 
@@ -1147,7 +1274,20 @@ export async function collectCreditBalances<TCredential = ChannelCredential, TPr
       ))
   const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
+  /**
+   * ⚠️ **这里仍是串行**（与 `collectCreditsStatus` 的有限并发**刻意不同**）。
+   *
+   * `collectCreditsStatus` 于 2026-10-22 改成有限并发（默认 3），本函数**没有**
+   * 跟着改，理由是两者接的东西不同：那个是逐账号**只读状态查询**
+   * （minimax 两家 GET + buddy 两家的 activity status POST，无副作用、一次/账号），
+   * 而本函数是面板「刷新积分」的主路径，各家余额接口都有速率限制（且部分带写语义，
+   * 例如 astudio 的 `importLocalSession`、minimax 的积分端点），并发收益不明而
+   * 风险更高。⇒ 要改这里必须**逐家**核对限流策略，不能因为「隔壁改了」就跟着改。
+   *
+   * ⚠️ 也别把「顺序查询避免并发触发风控」当成通用铁律 —— 它对**写操作**
+   * （`collectClaimResults`，签到）与**余额查询**（本函数）成立，对
+   * `credits.status` 那种只读单发的状态查询不成立（依据见 `collectCreditsStatus`）。
+   */
   for (const entry of accounts) {
     let balance: CreditBalance | null = null
     let error: string | undefined
