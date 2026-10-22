@@ -1,0 +1,471 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
+  DEFAULT_IMAGE_PIXEL_BUDGET,
+  REQUEST_IMAGE_MAX_BYTES,
+  fitImageToPixelBudget,
+  projectRequestImage,
+  requestImageTargetFor,
+  RACCOON_REQUEST_IMAGE_MAX_BYTES,
+  type ImageRequestTarget,
+} from '../../src/image-budget.js'
+import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
+import { RACCOON } from '../../src/raccoon-product.js'
+
+/**
+ * 图片像素预算的回归用例（Gitee issue !IKITT9）。
+ *
+ * 用户症状：带截图的会话积累到 36 张后**每一轮都失败且不可恢复**，
+ * 报 `prompt is too long: 100001 tokens > 100000 maximum`，自动压缩试 3 次全灭。
+ *
+ * 这里锁三件事：
+ *
+ * 1. **缩放几何**（纯函数）—— 每张图按固定像素预算派生目标尺寸，
+ *    小图绝不放大、非法尺寸绝不瞎猜。
+ * 2. **回退方向**（适配器行为）—— 拿不到请求版本时必须**发原图**；
+ *    缩放是优化，不能变成新的故障源（issue 特别标注的边界）。
+ * 3. **错误分类** —— 「请求过大」在报文**没有 `extError`** 时会被 harness 的
+ *    通用分类器漏判成 `INVALID_REQUEST`，而那个码既不重试也不触发压缩。
+ */
+
+const CREDENTIAL = {
+  access_token: 'AT',
+  refresh_token: 'RT',
+  expires_at: String(Date.now() + 7_200_000),
+} as unknown as BuddyCredential
+
+/** 一张 1721×997 的截图（issue 里失败会话的真实尺寸）。 */
+const SCREENSHOT = {
+  attachmentId: 'att-1',
+  mediaType: 'image/png',
+  bytes: 1_715_837,
+  width: 1721,
+  height: 997,
+}
+
+interface Target {
+  width: number
+  height: number
+  maxBytes: number
+}
+
+interface DriveOptions {
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  readImageRequest?: (
+    attachment: unknown,
+    target: Target,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /** 让请求以该状态码 + 报文失败（用于错误分类用例）。 */
+  failWith?: { status: number; body: string }
+  product?: BuddyProduct
+  /** 附件引用（默认一张 1721×997 的截图）。 */
+  attachment?: unknown
+}
+
+interface DriveResult {
+  /** 实际发出的请求体；请求没发出去时为 undefined。 */
+  body?: Record<string, unknown>
+  /** 适配器为每张图请求的派生目标。 */
+  targets: Target[]
+  /** stream 抛出的错误（成功时为 undefined）。 */
+  error?: unknown
+}
+
+/** 跑一轮对话，把请求体、派生目标与错误一次取回。 */
+async function drive(options: DriveOptions = {}): Promise<DriveResult> {
+  const targets: Target[] = []
+  let body: Record<string, unknown> | undefined
+  const adapter = new BuddyAdapter({
+    credentialRef: 'BUDDY_ACCOUNT_TEST' as never,
+    resolveCredential: async () => CREDENTIAL,
+    refresh: async () => {},
+    fetchImpl: (async (_url: unknown, init?: { body?: string }) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (options.failWith !== undefined) {
+        return new Response(options.failWith.body, { status: options.failWith.status })
+      }
+      return new Response('data: [DONE]\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    }) as unknown as typeof fetch,
+    ...(options.readImage ? { readImage: options.readImage } : {}),
+    ...(options.product ? { product: options.product } : {}),
+    ...(options.readImageRequest
+      ? {
+        readImageRequest: (attachment: unknown, target: Target) => {
+          targets.push(target)
+          return options.readImageRequest!(attachment, target)
+        },
+      }
+      : {}),
+  })
+
+  const result: DriveResult = { targets }
+  try {
+    for await (const _chunk of adapter.stream({
+      provider: 'buddy',
+      model: 'deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: '看这张图' }, { type: 'image', attachment: options.attachment ?? SCREENSHOT }],
+      }] as never,
+      signal: new AbortController().signal,
+    } as never)) {
+      /* 抽干即可 */
+    }
+    result.body = body
+  } catch (error) {
+    result.error = error
+    result.body = body
+  }
+  return result
+}
+
+/**
+ * 取请求体里那条 user 消息的多模态 parts。
+ *
+ * ⚠️ **按 role 找消息，不按索引**：新形态（issue IKLIFH，`0dd27ca`）把图片与
+ * 提问合并进**同一条** user 消息，且 parts 顺序为「图在前、文本在后」
+ * （`flushToolImages` 实测两种顺序都能被上游看到，故取「图在前」）。
+ * 早先这里返回 `[text, image]`、`[image, text]` 两种形态下都由调用方按
+ * **下标 `[1]`** 取图，于是新形态下取到文本 ⇒ `undefined`。
+ * ⚠️ 那是**断言与实现漂移**，不是实现缺陷：wire 上图片确实在（见下方
+ * `imageUrlOf` 的存在性断言）。
+ */
+function userParts(body?: Record<string, unknown>): Array<{ type: string; image_url?: { url: string } }> {
+  const messages = (body?.messages ?? []) as Array<Record<string, unknown>>
+  const user = messages.find((m) => m.role === 'user')
+  return (user?.content ?? []) as Array<{ type: string; image_url?: { url: string } }>
+}
+
+/**
+ * 从 user 消息的 parts 里取出**第一张图片**的 data URL。
+ *
+ * ⚠️ **必须按 `type` 找，不得按下标**：parts 顺序不是契约（两种顺序上游都收），
+ * 按下标取会在顺序一变时静默取到文本 —— 那正是本次 5 条红灯的成因。
+ * @param parts - user 消息的 parts
+ * @returns 第一张图片的 data URL；没有图片时返回 undefined
+ */
+function imageUrlOf(parts: Array<{ type: string; image_url?: { url: string } }>): string | undefined {
+  return parts.find((part) => part.type === 'image_url')?.image_url?.url
+}
+
+/** ⚠️ 反向验证锚点：被 {@link imageUrlOf} 的调用点引用，不得删除。 */
+export const IMAGE_BUDGET_REVERSE_ANCHOR = true
+
+describe('fitImageToPixelBudget：按总像素预算求目标尺寸', () => {
+  it('⚠️ 1721×997 的截图在默认预算下缩到 1051×608', () => {
+    // 面积 1,715,837 → 预算 640,000，线性因子 sqrt(640000/1715837) ≈ 0.6107。
+    // 报障者实现的数字是 1050×608 —— 差 1 px 来自取整口径，同档即可。
+    expect(fitImageToPixelBudget(1721, 997, DEFAULT_IMAGE_PIXEL_BUDGET)).toEqual({
+      width: 1051,
+      height: 608,
+    })
+  })
+
+  it('结果面积不超预算，且宽高比误差小于 1%', () => {
+    const fitted = fitImageToPixelBudget(1721, 997, DEFAULT_IMAGE_PIXEL_BUDGET)!
+    expect(fitted.width * fitted.height).toBeLessThanOrEqual(DEFAULT_IMAGE_PIXEL_BUDGET)
+    const sourceRatio = 1721 / 997
+    const targetRatio = fitted.width / fitted.height
+    expect(Math.abs(targetRatio - sourceRatio) / sourceRatio).toBeLessThan(0.01)
+  })
+
+  it('⚠️ 小图原样返回，绝不放大（放大只会让文字更糊）', () => {
+    expect(fitImageToPixelBudget(320, 200, DEFAULT_IMAGE_PIXEL_BUDGET)).toEqual({ width: 320, height: 200 })
+    // 恰好等于预算不算超
+    expect(fitImageToPixelBudget(800, 800, DEFAULT_IMAGE_PIXEL_BUDGET)).toEqual({ width: 800, height: 800 })
+  })
+
+  it('细长图（滚动截图）同样按面积缩，且不出现 0 边', () => {
+    const fitted = fitImageToPixelBudget(1200, 9000, DEFAULT_IMAGE_PIXEL_BUDGET)!
+    expect(fitted.width).toBeGreaterThanOrEqual(1)
+    expect(fitted.height).toBeGreaterThanOrEqual(1)
+    expect(fitted.width * fitted.height).toBeLessThanOrEqual(DEFAULT_IMAGE_PIXEL_BUDGET)
+  })
+
+  it('非法输入返回 undefined（调用方据此回退原图，绝不瞎猜尺寸）', () => {
+    expect(fitImageToPixelBudget(Number.NaN, 997, 640_000)).toBeUndefined()
+    expect(fitImageToPixelBudget(1721, 0, 640_000)).toBeUndefined()
+    expect(fitImageToPixelBudget(1721, 997, -1)).toBeUndefined()
+    expect(fitImageToPixelBudget(1721, 997, Number.POSITIVE_INFINITY)).toBeUndefined()
+  })
+})
+
+describe('requestImageTargetFor：组装附件服务的请求目标', () => {
+  it('未配置预算时用默认 640,000 px，并带 2 MiB 字节目标', () => {
+    expect(requestImageTargetFor(1721, 997, undefined)).toEqual({
+      width: 1051,
+      height: 608,
+      maxBytes: REQUEST_IMAGE_MAX_BYTES,
+    })
+    expect(DEFAULT_IMAGE_PIXEL_BUDGET).toBe(640_000)
+    expect(REQUEST_IMAGE_MAX_BYTES).toBe(2 * 1024 * 1024)
+  })
+
+  it('产品给了更小的预算就更狠地缩（预算是产品级旋钮）', () => {
+    const target = requestImageTargetFor(1721, 997, 160_000)!
+    expect(target.width * target.height).toBeLessThanOrEqual(160_000)
+  })
+})
+
+// ⚠️ **整组移除**：「BuddyAdapter 发请求版本 / 回退原图」依赖已删除的适配器。
+//    该适配器是 `readImageRequest` 桥接的唯一实现方；渠道删除后这组没有被测对象。
+//    ⚠️ 覆盖缺口如实登记：`readImageRequest` 的「缩放 / 回退 / 不瞎猜」三条判据
+//    现无适配器级覆盖 —— 通用层（`fitImageToPixelBudget` / `projectRequestImage`）
+//    仍由本文件其余组覆盖。
+
+describe('五个适配器都真的走了共享投影（不再各自裸发原图）', () => {
+  /**
+   * 本 issue 的缺陷形态就是「一个适配器接了、其余没接」—— 五个适配器的图片
+   * 代码原本是**同一形状重复五遍**，正是最容易漏改的结构。
+   *
+   * 这里用源码级断言而不是给五家各搭一套适配器桩：qoder 要 uid + WASM、
+   * lobsterai 要 remoteMeta、cline 要先暖目录，搭起来的成本远高于它保护的
+   * 那一行代码；而共享实现本身已由上面的行为用例锁死。
+   * raccoon 是唯一例外（构造最便宜），它有真行为用例验证字节目标。
+   */
+  const root = resolve(fileURLToPath(new URL('.', import.meta.url)), '../..')
+  const read = (rel: string): string => readFileSync(resolve(root, rel), 'utf8')
+  const codeOnly = (source: string): string =>
+    source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+
+  /**
+   * 撞**请求体体积**的四家：字节目标是主约束，必须显式传给投影
+   * （raccoon 512 KB、其余 1 MiB，见 `src/image-budget.ts`）。
+   */
+  const BODY_LIMITED = [
+    'src/raccoon-adapter.ts',
+    'src/qoder-adapter.ts',
+    'src/lobsterai-adapter.ts',
+    'src/cline-adapter.ts',
+  ]
+
+  it.each(BODY_LIMITED)('%s 传像素预算 + 字节目标，且回退顺序正确', (rel) => {
+    const source = codeOnly(read(rel))
+    expect(source, `${rel}: 未引共享实现`).toContain("from './image-budget.js'")
+    const call = /projectRequestImage\(ref, \{([\s\S]{0,260}?)\}\)/.exec(source)
+    expect(call, `${rel}: 未走共享投影`).not.toBeNull()
+    expect(call![1], `${rel}: 没传像素预算`).toContain('pixelBudget')
+    expect(call![1], `${rel}: 没传字节目标`).toContain('maxBytes')
+    // ⚠️ 回退方向必须是「投影拿不到才读原图」，反了就等于永远发原图。
+    expect(source, `${rel}: 回退顺序不对`).toMatch(/projected \?\? await readImage\(ref\)/)
+  })
+
+  /**
+   * buddy 是**最早**接的一家，形状与上面四家不同：撞的是图片 token 预算，
+   * 字节目标用共享默认的 2 MiB 即可（不传 `maxBytes` 是有意的）；
+   * 回退写成 `if (projected !== undefined) { …; continue }` 而非 `??`。
+   * 单列一条而不是塞进上面的循环，是为了让这两种形状**都**被显式锁住 ——
+   * 否则将来有人"统一形状"时会不知不觉改掉语义。
+   */
+  // ⚠️ 「buddy 走共享投影」这条源码文本断言随渠道删除而移除；它锁的是该适配器
+  //    独有的回退形状（`if (projected !== undefined)`），现无被测对象。
+  it('宿主侧为这五家都桥接了 readImageRequest', () => {
+    const source = codeOnly(read('src/index.ts'))
+    // buddy 与 workbuddy 各一处、raccoon / qoder / qodercn / lobsterai / cline 各一处。
+    const bridges = source.match(/readImageRequest: makeReadImageRequest\(ctx\)/g) ?? []
+    expect(bridges.length, `只桥接了 ${bridges.length} 处`).toBeGreaterThanOrEqual(5)
+  })
+
+  it('未接缩放的两家仍走原图路径（loomy / trae 不误接）', () => {
+    // ⚠️ 本条**只是防止误以为已经全接了**，不是「不许接」：
+    // loomy 与 trae 的两条旧理由都已被 issue IKKX0T 推翻（见 `tests/e2e/README.md`
+    // 与 `docs/agent-notes/protocol-wire.md`），但**当前仍刻意不接** ——
+    // 唯一理由是「边界未经本仓库复测」（两家 fixture 量纲不同，不能直接套用）。
+    // 完整的背景、复测入口与「复测后要改哪 4 处」写在：
+    //   · `src/loomy-product.ts` / `src/trae-product.ts` 的 `imageMaxBytes` 注释
+    //   · `src/loomy-adapter.ts` / `src/trae-adapter.ts` 里 `readImage` 那一段的注释
+    // 复测出边界后**应当**接上并删掉本条。
+    for (const rel of ['src/loomy-adapter.ts', 'src/trae-adapter.ts']) {
+      expect(codeOnly(read(rel)), `${rel}: 意外接入了缩放`).not.toContain('projectRequestImage')
+    }
+  })
+
+  it('zcode 的宿主桥接必须把字节目标传下去（适配器读 options.imageMaxBytes）', () => {
+    // ⚠️ zcode 与前四家**形状不同**：它读的是 `options.imageMaxBytes`（构造参数），
+    // 而不是 product 字段。`index.ts` 原先**一处都没传** ⇒ 同样落到 2 MiB 默认值。
+    // 这条按符号名断言，不用行号（本仓库的既定约定）。
+    const source = codeOnly(read('src/index.ts'))
+    const zcodeBlock = /registerZcodeLlm\(ctx, \{[\s\S]*?\n\}\)/.exec(source)
+    expect(zcodeBlock, '未找到 zcode 的注册块（符号被改名了？）').not.toBeNull()
+    expect(
+      zcodeBlock![0],
+      'zcode 的注册处没传 imageMaxBytes ⇒ 缩放目标回退到 2 MiB 默认值',
+    ).toContain('imageMaxBytes')
+  })
+})
+
+/**
+ * ⚠️ **按体积设限的家必须显式给 `imageMaxBytes`**（2026-10-12 修）。
+ *
+ * ## 真实缺陷
+ *
+ * `qoder` / `qodercn` / `cline` / `lobsterai` 四家的 product **都没赋**这个字段，
+ * 于是适配器把 `undefined` 传给 `requestImageTargetFor`，落到它的**默认参数**
+ * `REQUEST_IMAGE_MAX_BYTES` = **2 MiB** —— 而那个默认是为腾讯系那道
+ * **图片 token 预算**准备的（字节不是它的约束），这四家撞的却都是**请求体体积**。
+ *
+ * 后果不是「慢一点」，而是**越过上游的硬限**：qoder 的上游在报错里写明了
+ * `maximum allowed 52428800 bytes`（50 MiB，issue IKKX0T 实测），而
+ * 24 张 × 2 MiB × 4/3 = **64 MiB** > 50 MiB。文档与实现从此分叉：
+ * `src/image-budget.ts` 与四家接口注释都写着「1 MiB」，
+ * 而 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES` 这个**专为该用途定义**的常量
+ * 除定义处外**零引用**（死代码），没有任何用例能发现这件事。
+ *
+ * ## 为什么断言「真值」而不是「源码里有赋值」
+ *
+ * 源码级断言（`toContain('imageMaxBytes:')`）挡不住「赋了一个错的值」，
+ * 而本缺陷的两种形态（漏赋值 / 赋成 2 MiB）**症状完全相同**。
+ * 故这里直接对**产品配置对象**求值，并断言经过 `requestImageTargetFor`
+ * 之后的**实际字节目标** —— 那是链路里真正生效的那个数。
+ */
+describe('按体积设限的家必须显式给 imageMaxBytes（Issue IKKX0T 的连带缺陷）', () => {
+  /** 这些家撞的都是**请求体体积**，故字节目标是主约束。 */
+  const BODY_LIMITED_PRODUCTS = [
+    ['qoder', () => import('../../src/qoder-product.js').then((m) => m.QODER)],
+    ['qodercn', () => import('../../src/qoder-product.js').then((m) => m.QODER_CN)],
+    ['cline', () => import('../../src/cline-product.js').then((m) => m.CLINE)],
+    ['lobsterai', () => import('../../src/lobsterai-product.js').then((m) => m.LOBSTERAI)],
+  ] as const
+
+  it.each(BODY_LIMITED_PRODUCTS)('%s：实际生效的字节目标是 1 MiB，不是回退默认的 2 MiB', async (name, load) => {
+    const product = await load()
+    const target = requestImageTargetFor(2560, 1600, product.imagePixelBudget, product.imageMaxBytes)
+    expect(target, '派生目标失败（尺寸非法？）').toBeDefined()
+    expect(
+      target!.maxBytes,
+      `${name} 没显式给 imageMaxBytes，回退到了 2 MiB 的默认值 —— `
+      + '那会让请求体翻倍并可能越过上游硬限（qoder 明写 50 MiB）',
+    ).toBe(DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES)
+    expect(target!.maxBytes, '本用例的前提是它与默认回退值不同，否则断言是同义反复')
+      .not.toBe(REQUEST_IMAGE_MAX_BYTES)
+  })
+
+  it('⚠️ qoder 的硬限算术：24 张必须留在上游写明的 50 MiB 之内', () => {
+    // 上游在报错原文里给出了精确值：`maximum allowed 52428800 bytes`。
+    // 这条把「1 MiB 够不够」从「注释里的话」变成**可计算的判据**：
+    // 2 MiB 时 24 张 = 64 MiB **超限**，1 MiB 时 = 32 MiB 有余量。
+    const QODER_UPSTREAM_LIMIT = 52_428_800
+    const images = 24
+    const base64Growth = 4 / 3
+    const bodyAt = (perImage: number): number => images * perImage * base64Growth
+    expect(bodyAt(DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES), '1 MiB 应当有余量')
+      .toBeLessThan(QODER_UPSTREAM_LIMIT)
+    expect(bodyAt(REQUEST_IMAGE_MAX_BYTES), '2 MiB 会越过上游硬限 —— 这正是本缺陷')
+      .toBeGreaterThan(QODER_UPSTREAM_LIMIT)
+  })
+})
+
+// ⚠️ **整组移除**：`11115`「请求过大」的分类判据实现在已删除的适配器内
+//    （它不在 `image-budget.ts` 里 —— 该文件只是文档中引用了这个报文样例）。
+//    渠道删除后，这组断言失去被测对象。
+
+describe('projectRequestImage：九个适配器共用的请求版本投影', () => {
+  it('把像素预算与**字节目标**一起传给桥接（raccoon 靠后者对付 10MB 上限）', async () => {
+    const seen: ImageRequestTarget[] = []
+    const out = await projectRequestImage(
+      { attachmentId: 'att', width: 2560, height: 1600 },
+      {
+        readImageRequest: async (_a, target) => {
+          seen.push(target)
+          return { data: new Uint8Array([1]), mediaType: 'image/jpeg' }
+        },
+        pixelBudget: 640_000,
+        maxBytes: RACCOON_REQUEST_IMAGE_MAX_BYTES,
+      },
+    )
+    expect(seen).toEqual([{
+      width: 1011, height: 632, maxBytes: RACCOON_REQUEST_IMAGE_MAX_BYTES,
+    }])
+    expect(out?.mediaType).toBe('image/jpeg')
+  })
+
+  it('未桥接 / 缺尺寸 / 桥接抛错 → 一律返回 undefined（即发原图）', async () => {
+    const attachment = { attachmentId: 'att', width: 2560, height: 1600 }
+    expect(await projectRequestImage(attachment, { readImageRequest: undefined }))
+      .toBeUndefined()
+    expect(await projectRequestImage({ attachmentId: 'att' }, {
+      readImageRequest: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+    })).toBeUndefined()
+    expect(await projectRequestImage(attachment, {
+      readImageRequest: () => { throw new Error('ATTACHMENT_PROJECTION_UNSUPPORTED') },
+    })).toBeUndefined()
+  })
+})
+
+describe('RaccoonAdapter：请求版本优先（该家按请求体字节设限）', () => {
+  /** 跑一轮并抓回请求体；模型侧响应是什么不重要（探针只关心我们发了什么）。 */
+  async function captureRaccoonBody(options: {
+    readImageRequest?: (a: unknown, t: ImageRequestTarget) => Promise<
+      { data: Uint8Array; mediaType: string } | undefined>
+  }): Promise<{ body: string; targets: ImageRequestTarget[] }> {
+    const targets: ImageRequestTarget[] = []
+    let body = ''
+    const adapter = new RaccoonAdapter({
+      credentialRef: 'RACCOON_ACCESS_TOKEN' as never,
+      resolveCredential: async () => ({
+        access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+      }) as never,
+      refresh: async () => {},
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3, 4]), mediaType: 'image/png' }),
+      ...(options.readImageRequest ? { readImageRequest: options.readImageRequest } : {}),
+      product: RACCOON,
+      fetchImpl: (async (_url: unknown, init?: { body?: string }) => {
+        body = String(init?.body ?? '')
+        return new Response('data: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      }) as unknown as typeof fetch,
+    })
+    try {
+      for await (const _chunk of adapter.stream({
+        provider: 'raccoon',
+        // 兜底表里唯一「免费 + supportsImage: true」的一条（e2e 实测该家
+        // 三个优先候选的图片能力都是 false 或不存在）。
+        model: 'sn-sensenova-6-8-flash',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: '看这张图' },
+            { type: 'image', attachment: { attachmentId: 'att-1', width: 2560, height: 1600 } },
+          ],
+        }],
+        signal: new AbortController().signal,
+      } as never)) { /* noop */ }
+    } catch { /* 响应格式不是本用例的关注点 */ }
+    return { body, targets }
+  }
+
+  it('⚠️ 用**该家自己的** 512 KB 字节目标，而不是 buddy 的 2 MiB', async () => {
+    // 实测该网关 `HTTP_413: request body exceeds 10MB`：两张 base64 后
+    // ≈3.9 MB 的原图再加别的内容就可能被拒。字节目标是这里的主约束。
+    const seen: ImageRequestTarget[] = []
+    const { body } = await captureRaccoonBody({
+      readImageRequest: async (_a, target) => {
+        seen.push(target)
+        return { data: new Uint8Array([9]), mediaType: 'image/jpeg' }
+      },
+    })
+    expect(seen).toEqual([{
+      width: 1011, height: 632, maxBytes: RACCOON_REQUEST_IMAGE_MAX_BYTES,
+    }])
+    expect(body).toContain('data:image/jpeg;base64')
+    expect(body).not.toContain('data:image/png;base64,AQID')
+  })
+
+  it('桥接不可用时回退原图（不得让请求失败）', async () => {
+    const { body } = await captureRaccoonBody({ readImageRequest: async () => undefined })
+    expect(body).toContain('data:image/png;base64,AQID')
+  })
+
+  it('未配置桥接时保持既有行为（发原图）', async () => {
+    const { body } = await captureRaccoonBody({})
+    expect(body).toContain('data:image/png;base64,AQID')
+  })
+})

@@ -1,0 +1,24 @@
+# dsh-providers-hub 配置包补丁：在空配置根上追加插件行。
+# 后续配置补丁可通过 id 引用此行。
+# ⚠️ 行 id `codearts-auth` 与包名无关，是别的 patch 引用本行的**稳定锚点** ——
+#    改名时只动 `name`（= 要加载的模块名，必须与 package.json 的包名一致），
+#    id 保持不变。
+- insert:
+    - id: codearts-auth
+      name: 'dsh-providers-hub'
+
+# ── 系统提示词补丁：**已撤出配置层**（2026-10-22）─────────────────────────
+#
+# 原实现是用一条「按 id 定位」的补丁关掉宿主注入的
+#   You are an AI agent powered by DeepSeek Harness.
+#   `@deepseek-ai/dsh-system-prompt` 的 `includeHarnessIdentity: false`
+#
+# ⚠️⚠️ **已改为程序内替换，不要加回来**：用户明确要求「不依赖改配置」
+# （改宿主配置不稳：宿主升级改了键名、或 patch 的合并语义变化，都会**静默失效**
+# 且不报错）。现行实现是 `src/openai-gateway/tencent-fingerprint.ts` 里那条
+# 「DSH 身份首句」指纹 —— 出站 wire 上把整句改写成**官方同形**措辞：
+#   You are an AI coding assistant, powered by a large language model
+#
+# 差别（如实记录）：配置补丁是「源头不注入」（对所有 provider 生效、省 token），
+# 程序替换是「腾讯系出站时改写」（其余渠道不拦、无需改写；而模型自己在正文里
+# 复述这句时，只有这一层管得到）。
