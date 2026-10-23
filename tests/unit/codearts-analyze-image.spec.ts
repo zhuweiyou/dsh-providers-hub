@@ -497,17 +497,16 @@ describe.skipIf(dshToolsEntry === null)('analyzeImage：工具注册必须过宿
   })
 
   /**
-   * 守卫 ⑯：`parameters: {}` 是**合法**的空参数 schema。
+   * 守卫 ⑯：无参数工具也要发送**明确的 object schema**。
    *
-   * ⚠️ 这格容易被「顺手补齐」改坏：有人看到 `parameters: {}` 觉得不完整，
-   * 补成 `{ type: 'object', required: ['…'] }` 而没有对应 properties ⇒
-   * 宿主报 `required names "…" which is not in properties`。
-   * 本工具**不接受任何参数**（图片从会话历史取），空对象就是正确形态。
+   * 宿主虽然接受 `parameters: {}`，但 Buddy 网关会把它判成
+   * `invalid_function_call_parameters`。保留空 properties，既不增加参数，
+   * 又让国内/国际腾讯网关都能识别这是一个合法的空对象参数表。
    */
-  it('⑯ parameters 是空对象 schema（本工具不收参数），且合法', async () => {
+  it('⑯ parameters 是明确的空 object schema（本工具不收参数），且合法', async () => {
     const { assertSupportedJsonSchema } = await importDshTools()
     const tool = registerWithRealValidator(assertSupportedJsonSchema)
-    expect(tool.parameters).toEqual({})
+    expect(tool.parameters).toEqual({ type: 'object', properties: {} })
     expect(() => assertSupportedJsonSchema(tool.parameters)).not.toThrow()
   })
 })

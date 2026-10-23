@@ -22,6 +22,7 @@ import {
   isB3TraceId,
   mergeAdjacentToolCalls,
   normalizeDeveloperRole,
+  normalizeEmptyToolParameters,
   normalizeImageUrlParts,
   normalizeToolChoice,
   prepareBuddyBody,
@@ -139,6 +140,34 @@ describe('normalizeToolChoice', () => {
     const unknown: Record<string, unknown> = { tool_choice: { type: 'weird' } }
     normalizeToolChoice(unknown)
     expect('tool_choice' in unknown).toBe(false)
+  })
+})
+
+describe('normalizeEmptyToolParameters', () => {
+  it('空的嵌套 parameters 补成明确的 object schema', () => {
+    const body: Record<string, unknown> = {
+      tools: [{ type: 'function', function: { name: 'analyzeImage', parameters: {} } }],
+    }
+    normalizeEmptyToolParameters(body)
+    const fn = ((body['tools'] as Record<string, unknown>[])[0] as Record<string, unknown>)['function'] as Record<string, unknown>
+    expect(fn['parameters']).toEqual({ type: 'object', properties: {} })
+  })
+
+  it('非空 schema 与消息正文保持不变', () => {
+    const schema = { type: 'object', properties: { path: { type: 'string' } } }
+    const body: Record<string, unknown> = {
+      messages: [{ role: 'user', content: 'parameters: {}' }],
+      tools: [{ function: { parameters: schema } }],
+    }
+    normalizeEmptyToolParameters(body)
+    expect(((body['tools'] as Record<string, unknown>[])[0]!['function'] as Record<string, unknown>)['parameters']).toBe(schema)
+    expect((body['messages'] as Record<string, unknown>[])[0]!['content']).toBe('parameters: {}')
+  })
+
+  it('顶层 parameters 形态也补齐', () => {
+    const body: Record<string, unknown> = { tools: [{ parameters: {} }] }
+    normalizeEmptyToolParameters(body)
+    expect((body['tools'] as Record<string, unknown>[])[0]!['parameters']).toEqual({ type: 'object', properties: {} })
   })
 })
 

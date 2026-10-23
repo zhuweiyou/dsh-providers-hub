@@ -270,7 +270,12 @@ export function installAnalyzeImage(
         'Analyse image or images the user attached in this turn and return a text description '
         + '(OCR text, objects, layout, colors). Use it when the current model cannot read images '
         + 'directly and the user attached a picture.',
-      parameters: {},
+      // Buddy 上游要求参数根节点明确声明为 object；显式写出空对象 schema，
+      // 避免「无参数工具」被当成 invalid function call parameters 拒绝。
+      parameters: {
+        type: 'object',
+        properties: {},
+      },
       output: {
         schema: {
           type: 'object',
