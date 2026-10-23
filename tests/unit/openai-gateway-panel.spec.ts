@@ -1530,9 +1530,15 @@ describe('允许局域网访问：地址与文案', () => {
     expect(gatewayLanOverrideHint(wildcardStatus({ lanAccess: false }))).toBe('')
   })
 
-  it('切换提示：开 ⇒ 给出第一条可用地址；关 ⇒ 明确回到回环', () => {
-    expect(gatewayLanToggleNotice({ running: true, lanUrls: ['http://192.168.1.8:8326/v1'] }, true))
-      .toContain('192.168.1.8')
+  it('切换提示：开 ⇒ **不印具体地址**（指向上方列表）；关 ⇒ 明确回到回环', () => {
+    // ⚠️ 2026-10-23 用户明确要求：提示条里不要指定某个地址 —— 上方列表已经有
+    // 全部可用地址，再挑一个印出来会让用户只看到那一个（多网卡时容易挑到 VPN/TUN
+    // 地址，实测见过 198.18.0.1，照它配就连不通）。
+    const opened = gatewayLanToggleNotice({ running: true, lanUrls: ['http://192.168.1.8:8326/v1'] }, true)
+    expect(opened).not.toContain('192.168.1.8')
+    expect(opened).not.toContain('http://')
+    expect(opened).toContain('上方列表')
+    // 「未检测到地址」仍是信息，必须说（这一格打印的不是地址本身）
     expect(gatewayLanToggleNotice({ running: true, lanUrls: [] }, true)).toContain('未检测到')
     expect(gatewayLanToggleNotice({ running: false, lanUrls: [] }, true)).toContain('没有在监听')
     expect(gatewayLanToggleNotice({ running: true, lanUrls: [] }, false)).toContain('127.0.0.1')

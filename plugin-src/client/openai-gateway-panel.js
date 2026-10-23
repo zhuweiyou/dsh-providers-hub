@@ -699,6 +699,11 @@ export function gatewayLanOverrideHint(status) {
 /**
  * 切换局域网访问后的提示语。
  *
+ * ⚠️ **开启时不要在提示里写具体地址**（用户 2026-10-23 明确要求）：
+ * 卡片上方已经**逐条列出**所有可用地址，而提示条再挑一个印出来会诱导用户只看到
+ * 那一个 —— 多网卡机器上很容易挑到 VPN/TUN 之类的地址（实测见过 `198.18.0.1`），
+ * 用户按它配置就连不通。故这里只做「状态确认 + 指向上方列表」。
+ *
  * @param {object | null | undefined} result `gateway.setLanAccess` 的响应
  * @param {boolean} next 用户想要的状态
  * @returns {string}
@@ -706,11 +711,12 @@ export function gatewayLanOverrideHint(status) {
 export function gatewayLanToggleNotice(result, next) {
   if (next !== true) return '已关闭局域网访问：网关只监听本机回环 127.0.0.1。';
   if (result?.running !== true) return '已开启局域网访问，但网关没有在监听（请检查端口是否被占用）。';
+  // ⚠️ 只报状态，不报地址（见上）。「未检测到地址」这一格仍是**信息**，必须说。
   const urls = Array.isArray(result?.lanUrls)
     ? result.lanUrls.filter((url) => typeof url === 'string')
     : [];
   if (urls.length === 0) return '已开启局域网访问（未检测到可用的局域网地址）。';
-  return `已开启局域网访问：${urls[0]}`;
+  return '已开启局域网访问：可用地址见上方列表（同一网络内的其它设备用它们访问）。';
 }
 
 /**
