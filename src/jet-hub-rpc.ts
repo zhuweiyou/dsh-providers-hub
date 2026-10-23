@@ -49,7 +49,8 @@ import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite,
   type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { isGatewayEnabled } from './openai-gateway/config.js'
+import { isGatewayEnabled, isWildcardHost } from './openai-gateway/config.js'
+import { lanGatewayUrls } from './openai-gateway/lan.js'
 import { collectGatewayEffortViews,
   collectGatewayModels,
   toGatewayModelIds,
@@ -59,6 +60,7 @@ import {
   gatewayAddress,
   gatewayApiKey,
   isGatewayRunning,
+  restartGatewayRuntime,
   setGatewayDesiredEnabled,
   } from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
@@ -345,6 +347,8 @@ import type {
   RpcProviderSetEnabledResponse,
   RpcGatewayStatusResponse,
   RpcGatewaySetEnabledRequest,
+  RpcGatewaySetLanAccessRequest,
+  RpcGatewaySetLanAccessResponse,
   RpcMinimaxXffRequest,
   RpcMinimaxXffResponse,
   RpcNativeSearchGetEnabledResponse,
@@ -1518,6 +1522,24 @@ function providerIdsOf(
   }
   const keys = Object.keys(modelAdapters ?? {})
   return keys.length > 0 ? keys.map((id) => ({ id })) : undefined
+}
+
+/**
+ * 组装网关的「暴露面」两字段（`lanAccess` + 可达的局域网 URL）。
+ *
+ * ⚠️ **两个分支共用**（`gateway.getEnabled` / `gateway.setEnabled` /
+ * `gateway.setLanAccess` 三处）：各算一遍必然漂移，而漂移的症状是
+ * 「开关显示已开、地址却是 127.0.0.1」——用户会照着抄一个连不上的地址。
+ *
+ * ⚠️ **只有真的绑在通配地址上才列 LAN URL**：绑 `127.0.0.1` 时那些 URL 连不通，
+ * 列出来等于误导。判据复用宿主的 `isWildcardHost`（不自己写正则）。
+ */
+function gatewayLanFields(
+  lanAccess: boolean,
+  address: { host: string; port: number } | null,
+): { lanAccess: boolean; lanUrls: string[] } {
+  if (address === null || !isWildcardHost(address.host)) return { lanAccess, lanUrls: [] }
+  return { lanAccess, lanUrls: lanGatewayUrls(address.port) }
 }
 
 /**
@@ -7987,6 +8009,8 @@ function registerJetHubEndpoints(
             })
           }, [] as RpcGatewayModel[]),
           modelsSource,
+          // 暴露面：开关与可达的局域网地址（判据见 `gatewayLanFields`）。
+          ...gatewayLanFields(pool.gatewayLanAccess(), address),
         }
         return { ok: true, value }
       }
@@ -8033,6 +8057,8 @@ function registerJetHubEndpoints(
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,
+          // 暴露面不随后者变化，但必须与 `getEnabled` **同形状**回传（三处共用同一函数）。
+          ...gatewayLanFields(pool.gatewayLanAccess(), blockedByEnv ? null : gatewayAddress() ?? null),
         }
         return { ok: true, value }
       }
@@ -8046,6 +8072,53 @@ function registerJetHubEndpoints(
       case 'nativeSearch.getEnabled': {
         const value: RpcNativeSearchGetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
         return { ok: true, value }
+      }
+
+      /**
+       * 切换「允许局域网访问」（2026-10-23）。
+       *
+       * ## 语义
+       *
+       * - 关（默认）⇒ 只监听 127.0.0.1；
+       * - 开 ⇒ 绑通配地址（`LAN_GATEWAY_HOST`），同一网络内其它设备可访问；
+       *   **仍必须带 API Key**（网关的鉴权一直在，这不是「无密码开放」）。
+       *
+       * ⚠️ **必须重建监听**：`server.listen(port, host)` 是初始化参数，Node 没有
+       * 换 host 的 API ⇒ 关旧实例 + 用新配置再起一个（`restartGatewayRuntime`）。
+       * 只改持久化不重建的话，症状是「开关显示已开、地址还是 127.0.0.1」。
+       *
+       * ⚠️ **env 优先**：若用户显式设了 `DSH_OPENAI_GATEWAY_HOST`，本开关**不会**
+       * 改写它（容器里刻意绑某个接口的部署不能被 UI 顶掉）。面板文案要说清这点。
+       *
+       * ⚠️ 回传**窄响应**（不回模型目录）：拨开关不该触发一次目录采集。
+       */
+      case 'gateway.setLanAccess': {
+        const req = payload as RpcGatewaySetLanAccessRequest
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        // 先落盘再重建：重建失败（端口冲突）不该让已写入的开关回滚成「看起来没生效」。
+        await pool.setGatewayLanAccess(req.enabled)
+        if (req.enabled) {
+          // 暴露面扩大必须留痕（事后追查「谁把网关开到局域网」的唯一线索）。
+          ctx.logger.warn(
+            '[jet-hub] 已开启「允许局域网访问」：网关将绑定全部网卡，'
+            + '同一网络内的其它设备可访问（隔离只靠 API Key）',
+          )
+        } else {
+          ctx.logger.info('[jet-hub] 已关闭「允许局域网访问」：网关只监听本机回环')
+        }
+        await restartGatewayRuntime()
+        const address = gatewayAddress() ?? null
+        return {
+          ok: true,
+          value: {
+            lanAccess: pool.gatewayLanAccess(),
+            running: isGatewayRunning(),
+            address,
+            lanUrls: gatewayLanFields(pool.gatewayLanAccess(), address).lanUrls,
+          } satisfies RpcGatewaySetLanAccessResponse,
+        }
       }
 
       case 'nativeSearch.setEnabled': {

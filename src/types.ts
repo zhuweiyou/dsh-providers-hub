@@ -1495,6 +1495,45 @@ export interface RpcGatewayStatusResponse {
    * - `none`：两者都拿不到，目录必然为空
    */
   modelsSource: 'catalog' | 'adapters' | 'none'
+  /**
+   * 「允许局域网访问」开关的持久化状态（2026-10-23）。
+   *
+   * `false`（缺省）⇒ 网关只监听本机；`true` ⇒ 绑通配地址，同一网络内其它设备
+   * 都能访问。**与 `enabled` 是两个独立开关**：一个管「跑不跑」，一个管「谁能连」。
+   */
+  lanAccess: boolean
+  /**
+   * 局域网可达的 OpenAI 兼容基地址（`http://192.168.1.8:8326/v1`…）。
+   *
+   * ⚠️ **只在 `lanAccess` 为真且确实绑在通配地址上时才有内容**：绑 127.0.0.1 时
+   * 这些 URL 连不通，列出来等于误导用户去复制一个必然超时的地址。
+   * ⚠️ 可能为空数组（多网卡全被过滤 / 只有回环）—— 此时 UI 应显示
+   * 「未检测到局域网地址」，而不是让用户猜。
+   */
+  lanUrls: string[]
+}
+
+/** RPC: 切换「允许局域网访问」（写操作，会**重建监听**：Node 不能原地换绑地址）。 */
+export interface RpcGatewaySetLanAccessRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 切换局域网访问的响应（**窄响应**，刻意不回整份状态）。
+ *
+ * ⚠️ 为什么不复用 `RpcGatewayStatusResponse`：那份要现采**模型目录**（逐 provider
+ * 一次远端/缓存调用）。用户只是拨了一个暴露面开关，不该为此付目录采集的代价；
+ * 客户端拿这几个字段 patch 进已有状态即可。
+ */
+export interface RpcGatewaySetLanAccessResponse {
+  /** 切换后的持久化状态。 */
+  lanAccess: boolean
+  /** 切换后可达的局域网地址（仅绑通配地址且确实在监听时非空）。 */
+  lanUrls: string[]
+  /** 重建后的运行态。 */
+  running: boolean
+  /** 重建后的实际监听地址。 */
+  address: { host: string; port: number } | null
 }
 
 /** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */

@@ -15,6 +15,11 @@ interface GatewaySwitchSource {
   gatewayEnabled(): boolean
 }
 
+/** 暴露面开关（2026-10-23）：`true` ⇒ 绑通配地址，同一网络内其它设备可访问。 */
+interface GatewayLanSwitchSource {
+  gatewayLanAccess(): boolean
+}
+
 /**
  * 桥接宿主的附件服务，供网关把客户端的 base64 图片落成 DSH 附件。
  *
@@ -51,6 +56,24 @@ export function mountOpenAiGateway(ctx: Context, pool?: GatewaySwitchSource): vo
   }
   const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
+  /**
+   * 读「允许局域网访问」开关。
+   *
+   * ⚠️ **缺方法 / 抛错即 false**：`pool` 是可选的（单测与其它装配路径），而暴露面
+   * 开关的缺省必须取更安全的一端 —— 读不到就当关闭，绝不放宽。
+   * ⚠️ **每次创建时现读**（不是 mount 时快照）：用户拨动开关后 runtime 会关掉旧
+   * 实例、重新走工厂；读快照会让开关「点了没反应，只有重启才生效」。
+   */
+  const readLanSwitch = (source?: GatewaySwitchSource): boolean => {
+    const candidate = source as (GatewaySwitchSource & Partial<GatewayLanSwitchSource>) | undefined
+    try {
+      return candidate?.gatewayLanAccess?.() === true
+    } catch (error) {
+      logger.warn(`[openai-gateway] 读取局域网访问开关失败，按关闭处理：${describe(error)}`)
+      return false
+    }
+  }
+
   try {
     // 设置页里的开关是**期望状态**：缺键 / 读取失败一律按启用（老用户行为不变），
     // 真正的判定（含 env 的更高优先级）在 runtime 里做。
@@ -62,6 +85,8 @@ export function mountOpenAiGateway(ctx: Context, pool?: GatewaySwitchSource): vo
         return createOpenAiGateway({
           ctx,
           llm: ctx.llm as unknown as LlmRuntimeLike,
+          // 暴露面开关：每次创建现读（见 `readLanSwitch` 的注释）。
+          lanAccess: readLanSwitch(pool),
           // 图片入站：把客户端的 base64 图片落成 DSH 附件。缺失时网关仍可正常
           // 提供文本能力，收到图片时明确报「未装载附件服务」而非静默丢图。
           attachments: makeGatewayAttachmentBridge(ctx),
@@ -84,6 +109,13 @@ export function mountOpenAiGateway(ctx: Context, pool?: GatewaySwitchSource): vo
     // 显式停用也要留痕：否则用户设了 env 却看不到任何提示，只能靠猜。
     // 仍继续挂载 runtime —— 设置页需要据此显示「被 env 阻止」而不是「开关坏了」。
     logger.info('[openai-gateway] DSH_OPENAI_GATEWAY_ENABLED 已停用本机网关')
+  }
+  if (readLanSwitch(pool)) {
+    // ⚠️ 暴露面变化**必须留痕**：日志是用户事后追查「谁把网关开到局域网」的唯一线索。
+    logger.warn(
+      '[openai-gateway] 已开启「允许局域网访问」：网关绑定全部网卡，'
+      + '同一网络内的其它设备可访问（隔离只靠 API Key）',
+    )
   }
   void applyGatewayDesiredState().catch((error: unknown) => {
     logger.error(`[openai-gateway] 启动异常：${describe(error)}`)

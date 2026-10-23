@@ -128,6 +128,35 @@ export async function applyGatewayDesiredState(): Promise<void> {
   await gateway.close()
 }
 
+/**
+ * **重建**监听实例（2026-10-23，为「允许局域网访问」开关服务）。
+ *
+ * ## 为什么必须重建、不能原地改
+ *
+ * 绑定地址是 `server.listen(port, host)` 的一次性参数 —— Node 没有「换 host」的
+ * API。用户拨动开关后，唯一能让新地址生效的办法是：关掉旧实例 → 用新配置再起一个。
+ *
+ * ⚠️ **失败也要让调用方知道**：`applyGatewayDesiredState` 按契约不抛（它把启动
+ * 失败记进日志、把 `running` 复位）。故这里**不吞掉「没起来」这件事** —— 调用方
+ * 用 `isGatewayRunning()` / `gatewayAddress()` 读结果，面板据此显示
+ * 「已选择开启但未监听」（与端口被占用的既有提示同一条路径）。
+ *
+ * ⚠️ 关闭旧实例失败**不阻断重建**：`close()` 抛错时旧 socket 可能已经半关，
+ * 但继续走下去至少能让新配置生效；把异常抛出去会让开关看起来「点了没用」。
+ */
+export async function restartGatewayRuntime(): Promise<void> {
+  const current = running
+  running = undefined
+  if (current !== undefined) {
+    try {
+      await current.close()
+    } catch {
+      // 忽略：见上面的注释（旧实例关不干净不该阻止新配置生效）。
+    }
+  }
+  await applyGatewayDesiredState()
+}
+
 /** 插件卸载时调用：停掉网关并清空工厂，避免热重载后残留旧实例的引用。 */
 export async function disposeGatewayRuntime(): Promise<void> {
   if (running !== undefined) {

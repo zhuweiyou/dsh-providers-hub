@@ -1,6 +1,26 @@
 export const DEFAULT_GATEWAY_HOST = '127.0.0.1'
 export const DEFAULT_GATEWAY_PORT = 8326
 
+/**
+ * 「允许局域网访问」开关打开时绑定的地址。
+ *
+ * ## 为什么是通配地址，而不是「自动探测到的那个局域网 IP」
+ *
+ * 用户诉求（2026-10-23）：「画面和逻辑都只绑定了 127.0.0.1，希望加个开关支持局域网
+ * 调用，默认不开启」。两种实现各有取舍：
+ *
+ * - **绑某一个探测到的 IP**：更"精确"，但 DHCP 续租换 IP、多网卡（WiFi/有线/WSL/
+ *   Docker/vEthernet）、VPN 拨入都会让它**静默失效** —— 而症状是「开关是开的、
+ *   但手机连不上」，用户完全无从排查。
+ * - **绑通配地址**：覆盖所有当前与将来出现的接口，IP 变了也不用重启；代价是
+ *   「暴露面 = 这台机器所有可路由的网卡」，包括直连公网的情况。
+ *
+ * 取后者，并把代价**如实写在 UI 上**（列出可用的局域网地址、提示只靠 API Key 隔离）。
+ * 理由：开关本身就是一次**显式授权**，而「IP 变了就静默失效」是本仓库最反感的
+ * 失败形态（不可观测、无从排查）。
+ */
+export const LAN_GATEWAY_HOST = '0.0.0.0'
+
 export interface OpenAiGatewayConfig {
   host: string
   port: number
@@ -338,9 +358,18 @@ export function isLoopbackHost(host: string): boolean {
  * 且带地址的报错（`server.ts` 会原文记进日志）。**别为了「更早失败」把它
  * 改成 DNS 预检**。
  */
-function resolveHost(env: NodeJS.ProcessEnv): string {
+function resolveHost(env: NodeJS.ProcessEnv, lanAccess: boolean): string {
   const raw = env.DSH_OPENAI_GATEWAY_HOST
-  if (raw === undefined || raw.trim() === '') return DEFAULT_GATEWAY_HOST
+  // ⚠️⚠️ **env 未设置时的两条路**（2026-10-23 加「局域网访问」开关）：
+  // - 开关关（默认）⇒ 127.0.0.1，行为与改动前**逐字节一致**；
+  // - 开关开 ⇒ 通配地址（见 {@link LAN_GATEWAY_HOST} 的取舍说明）。
+  //
+  // ⚠️ **env 显式给出地址时永远以 env 为准**（运维口径优先）：容器里
+  // `DSH_OPENAI_GATEWAY_HOST=172.21.0.8` 是**刻意**绑某个接口，UI 开关不该覆盖它。
+  // 此时开关只影响「env 没说话」那种默认情况，不会把容器地址悄悄放大成全网卡。
+  if (raw === undefined || raw.trim() === '') {
+    return lanAccess ? LAN_GATEWAY_HOST : DEFAULT_GATEWAY_HOST
+  }
   const host = stripHostBrackets(raw)
   // ⚠️ 归一化后为空（值只有空白或只有不可见字符）⇒ 回落默认。**绝不能把空串
   // 交给 `listen()`**：那会被当成「绑全部网卡」，正是本判据要防的事。
@@ -370,8 +399,11 @@ function resolveHost(env: NodeJS.ProcessEnv): string {
 }
 
 /** 解析本机网关配置，地址/端口错误时显式失败，避免静默换端口或静默监听全网卡。 */
-export function resolveGatewayConfig(env: NodeJS.ProcessEnv = process.env): OpenAiGatewayConfig {
-  const host = resolveHost(env)
+export function resolveGatewayConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { lanAccess?: boolean } = {},
+): OpenAiGatewayConfig {
+  const host = resolveHost(env, options.lanAccess === true)
   const rawPort = env.DSH_OPENAI_GATEWAY_PORT
   if (rawPort === undefined || rawPort.trim() === '') {
     return { host, port: DEFAULT_GATEWAY_PORT }

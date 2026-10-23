@@ -58,6 +58,14 @@ export interface OpenAiGatewayOptions {
   maxBodyBytes?: number
   home?: string
   env?: NodeJS.ProcessEnv
+  /**
+   * 「允许局域网访问」开关（2026-10-23）。`true` ⇒ 绑通配地址（见
+   * `config.ts` 的 `LAN_GATEWAY_HOST`），默认 `false` ⇒ 127.0.0.1。
+   *
+   * ⚠️ 它**只影响 `DSH_OPENAI_GATEWAY_HOST` 未设置时**的默认地址；env 显式给了
+   * 地址就一律以 env 为准（容器里刻意绑某个接口的部署，不能被 UI 开关改写）。
+   */
+  lanAccess?: boolean
   logger?: GatewayLogger
 }
 
@@ -166,7 +174,9 @@ function getHome(options: OpenAiGatewayOptions): string {
 
 export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGateway {
   const env = options.env ?? process.env
-  const config: OpenAiGatewayConfig = resolveGatewayConfig(env)
+  // `lanAccess` 来自持久化开关（默认 false ⇒ 127.0.0.1）；env 显式给地址时 env 优先，
+  // 判据在 `resolveGatewayConfig` 里，这里只转发。
+  const config: OpenAiGatewayConfig = resolveGatewayConfig(env, { lanAccess: options.lanAccess === true })
   // 密钥在**创建时**解析（而不是 start 时）：设置页要能在网关未运行时也能
   // 读到它，用户才能配置外部客户端。
   const apiKey = loadOrCreateApiKey(getHome(options), env)

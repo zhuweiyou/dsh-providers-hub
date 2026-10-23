@@ -344,6 +344,15 @@ export class AccountPool {
    */
   private gatewayEnabledCache = true
   /**
+   * 「允许局域网访问」开关的进程内副本（`true` = 绑通配地址）。
+   *
+   * 缺键语义是 **false**（与 {@link gatewayEnabledCache} **相反**）：网关开关丢键
+   * 只是「没跑起来」（可观测、点一下就好），而暴露面开关丢键会让网关**绑到全部网卡**
+   * 且毫无提示 —— 故缺键必须取更安全的那一端。见 `jet-hub-store.ts` 的
+   * `sanitizeGatewayLanAccess`。
+   */
+  private gatewayLanAccessCache = false
+  /**
    * 「渠道原生搜索」总开关的进程内副本（`false` = 全部搜索回官方 provider）。
    *
    * 缺键语义是**启用**（与 {@link gatewayEnabledCache} 同一方向）：老文档没有
@@ -476,6 +485,8 @@ export class AccountPool {
       this.aggregateOrderModeCache = state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry'
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
+      // 暴露面开关：缺键 → 关闭（方向与上一行相反，理由见字段注释）。
+      this.gatewayLanAccessCache = state.gatewayLanAccess === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
       // 侧栏入口开关同理：老文档没有该键 → 保持默认显示入口。
@@ -578,6 +589,7 @@ export class AccountPool {
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
         gatewayEnabled: this.gatewayEnabledCache,
+        gatewayLanAccess: this.gatewayLanAccessCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
         // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
         //    漏键会让用户关掉的侧栏入口在**任何**一次账号/黑名单/网关/顺序写入时
@@ -1028,6 +1040,35 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 「允许局域网访问」当前是否开启。
+   *
+   * 缺键语义为**关闭**（见 {@link gatewayLanAccessCache}）。
+   */
+  gatewayLanAccess(): boolean {
+    this.ensureLoaded()
+    return this.gatewayLanAccessCache
+  }
+
+  /**
+   * 打开/关闭「允许局域网访问」并落盘。
+   *
+   * ⚠️ 与 {@link setGatewayEnabled} 同约定：**只改状态**，真正的绑定地址变更由
+   * 调用方（`gateway.setLanAccess` 端点）在持久化之后**重建监听**完成 ——
+   * Node 的 `server.listen()` 不能原地换 host，必须关掉再起。
+   */
+  async setGatewayLanAccess(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.gatewayLanAccessCache === enabled) return
+    this.gatewayLanAccessCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，局域网访问开关仅本次会话有效')
       return
     }
     await this.queueStoreSave()

@@ -66,6 +66,12 @@ import {
   gatewayFootnote,
   gatewaySwitchDisabled,
   gatewayToggleNotice,
+  // 「允许局域网访问」开关（2026-10-23）。
+  gatewayBindLabel,
+  gatewayLanOverrideHint,
+  gatewayLanSwitchHint,
+  gatewayLanToggleNotice,
+  gatewayLanUrls,
   modelCapabilityBadge,
 } from './openai-gateway-panel.js';
 import {
@@ -6565,7 +6571,7 @@ function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied
  * 3. **状态全部来自宿主侧**（`gateway.getEnabled`），前端不拿 `enabled` 自行
  *    推导运行态 —— 端口冲突与 env 停用都会让两者不一致。
  */
-function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
+function GatewayPanel({ status, busy, notice, onToggle, onToggleLan, onReload, onClose }) {
   const [copied, setCopied] = React.useState(false);
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
@@ -6761,8 +6767,10 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           // 说法（与 gatewayEndpoint 返回 '' 的既有取舍同源：不编造具体地址）。
           React.createElement('code', { className: 'dim-jh-modelId' },
             status?.address
-              ? `在 ${status.address.host} 监听，供客户端调用`
-              : '在本机监听，供客户端调用')),
+              // ⚠️ 通配地址必须翻成「在所有网卡监听」（见 `gatewayBindLabel`）：
+              // 直接印 `在 0.0.0.0 监听` 会让人以为客户端要填 0.0.0.0。
+              ? `${gatewayBindLabel(status)}，供客户端调用`
+              : '只在本机监听，供客户端调用')),
         React.createElement('input', {
           type: 'checkbox',
           className: 'dim-jh-switch',
@@ -6780,6 +6788,47 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           key: `status-${index}`,
           className: 'dim-jh-modalHint dim-jh-gatewayLine',
         }, line)),
+      // ── 「允许局域网访问」开关（2026-10-23）──
+      //
+      // 用户诉求：「画面和逻辑都只绑定了 127.0.0.1，希望加个开关支持局域网调用，
+      // 默认不开启」。它与上面那个「启用网关」是**两个独立开关**：
+      //   启用 = 跑不跑；本开关 = 谁能连。
+      //
+      // ⚠️ 打开会**重建监听**（Node 不能原地换绑地址），故与主开关共用一个 busy。
+      React.createElement('div', {
+        className: 'dim-jh-gatewaySection',
+        style: { marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(127,127,127,0.18)' },
+      },
+      React.createElement('label', { className: 'dim-jh-modelRow' },
+        React.createElement('span', { className: 'dim-jh-modelInfo' },
+          React.createElement('strong', { className: 'dim-jh-modelName' }, '允许局域网访问'),
+          React.createElement('code', { className: 'dim-jh-modelId' },
+            status?.lanAccess === true ? '已在全部网卡监听' : '仅本机 127.0.0.1')),
+        React.createElement('input', {
+          type: 'checkbox',
+          className: 'dim-jh-switch',
+          role: 'switch',
+          checked: status?.lanAccess === true,
+          // 网关被 env 停用时同样禁用：此时拨它不会产生任何监听变化。
+          disabled: disabled || busy,
+          'aria-label': `${status?.lanAccess === true ? '关闭' : '开启'}局域网访问`,
+          onChange: () => void onToggleLan(status?.lanAccess !== true),
+        })),
+      React.createElement('p', { className: 'dim-jh-modalHint dim-jh-gatewayLine' },
+        gatewayLanSwitchHint(status)),
+      // 环境变量覆盖（有才显示）：否则用户会以为「开关点了没生效」。
+      gatewayLanOverrideHint(status) !== ''
+        ? React.createElement('p', { className: 'dim-jh-modalHint dim-jh-gatewayLine' },
+            gatewayLanOverrideHint(status))
+        : null,
+      // 可达的局域网地址：逐条列出，每条都能直接抄进客户端。
+      ...gatewayLanUrls(status).map((url, index) =>
+        React.createElement('p', {
+          key: `lan-${index}`,
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        },
+        React.createElement('code', { className: 'dim-jh-modelId' }, url))),
+      ),
       // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
       // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
       // 明文供手动选中 —— 绝不能变成「点了没反应」。
@@ -7935,6 +7984,47 @@ export function JetHubPage({ rpcCall }) {
   }, [rpcCall, loadGatewayStatus]);
 
   /**
+   * 切换**允许局域网访问**（2026-10-23）。
+   *
+   * ⚠️ 宿主会**重建监听**（Node 不能原地换绑地址），故：
+   * - 与主开关共用 `gatewayBusy`（重建期间再拨另一个开关会拿到中间态）；
+   * - 回传的是**窄响应**（`gateway.setLanAccess` 刻意不回模型目录）⇒ 这里
+   *   **patch 进已有状态**，而不是重拉整份 `gateway.getEnabled`（那份要采目录）。
+   *
+   * ⚠️ **不做乐观更新**：重建可能因端口占用失败，开关必须反映真实运行态。
+   */
+  const toggleGatewayLan = React.useCallback(async (nextEnabled) => {
+    setGatewayBusy(true);
+    setGatewayNotice(null);
+    try {
+      const res = await rpcCall('gateway.setLanAccess', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setGatewayStatus((prev) => (prev === null
+        ? prev
+        : {
+            ...prev,
+            lanAccess: res?.lanAccess === true,
+            lanUrls: Array.isArray(res?.lanUrls) ? res.lanUrls : [],
+            running: res?.running === true,
+            address: res?.address ?? prev.address,
+          }));
+      setGatewayNotice({
+        // 打开是一次暴露面扩大 ⇒ 用 warn 色提醒；关闭回 ok。
+        tone: nextEnabled ? 'warn' : 'ok',
+        text: gatewayLanToggleNotice(res, nextEnabled),
+      });
+    } catch (caught) {
+      console.error('[jet-hub] toggle gateway lan access failed:', caught);
+      if (!mounted.current) return;
+      setGatewayNotice({ tone: 'error', text: '操作失败：' + (caught?.message || '未知错误') });
+      // 重建可能已经发生一半 ⇒ 重新拉一次真实状态。
+      await loadGatewayStatus();
+    } finally {
+      if (mounted.current) setGatewayBusy(false);
+    }
+  }, [rpcCall, loadGatewayStatus]);
+
+  /**
    * 读取全部供应商的汇总状态。
    *
    * 一次请求拿全部 8 个（而不是逐个查）：服务端全程只用同步内存副本，
@@ -8629,6 +8719,7 @@ export function JetHubPage({ rpcCall }) {
           busy: gatewayBusy,
           notice: gatewayNotice,
           onToggle: toggleGateway,
+          onToggleLan: toggleGatewayLan,
           onReload: loadGatewayStatus,
           onClose: () => setShowGateway(false),
         })

@@ -62,7 +62,7 @@ import { isFilterActive, matchesModelQuery } from './model-filter.js';
 // 「已对外暴露」，面板于是输出它自己声称要消除的那种**错误安全陈述**
 // （两轮独立审计各自实测到，2026-10-13）。
 // ⚠️ 该模块必须**零 node import**（它同时被 esbuild 打进浏览器 bundle）。
-import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost } from '../../src/openai-gateway/config.js';
+import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost, isWildcardHost } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
   try {
@@ -585,7 +585,12 @@ export function gatewayButtonTitle(status) {
     return '本机 OpenAI 网关：已被环境变量 DSH_OPENAI_GATEWAY_ENABLED 停用，'
       + '在这里改开关不会让它监听端口。'
   }
-  if (status.running) return `本机 OpenAI 网关：运行中（${gatewayEndpoint(status)}）。`
+  if (status.running) {
+    // ⚠️ 「局域网可访问」必须出现在 tooltip 里：页头按钮是用户唯一的常驻入口，
+    // 暴露面状态不该只在弹窗里可见（2026-10-23 加开关时补）。
+    const lan = status.lanAccess === true ? '，局域网可访问' : '';
+    return `本机 OpenAI 网关：运行中（${gatewayEndpoint(status)}${lan}）。`
+  }
   if (status.enabled) return '本机 OpenAI 网关：已选择开启，但当前未在监听（通常是端口被占用）。'
   return '本机 OpenAI 网关：已关闭。'
 }
@@ -608,7 +613,104 @@ export function gatewayButtonTitle(status) {
 export function gatewayEndpoint(status) {
   const address = status?.address
   if (!address) return '';
-  return gatewayHttpUrl(address.host, address.port, '/v1');
+  // ⚠️ 绑**通配地址**（「允许局域网访问」打开）时 `0.0.0.0` 不是可连接的地址：
+  // 本机客户端该用 127.0.0.1，局域网地址另见 `lanUrls`。直接把
+  // `http://0.0.0.0:…/v1` 印给用户，抄进客户端就是连不上。
+  const host = isWildcardHost(address.host) ? '127.0.0.1' : address.host
+  return gatewayHttpUrl(host, address.port, '/v1');
+}
+
+/* ─────────────────── 「允许局域网访问」开关（2026-10-23） ─────────────────── */
+
+/**
+ * 局域网可达地址（宿主给的 `lanUrls`，非法项滤掉）。
+ *
+ * ⚠️ **只在绑通配地址时非空**（判据在宿主 `gatewayLanFields`）—— 绑 127.0.0.1 时
+ * 这些 URL 连不通，前端不得自己拼一个「看起来能用」的地址。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string[]}
+ */
+export function gatewayLanUrls(status) {
+  const list = status?.lanUrls;
+  if (!Array.isArray(list)) return [];
+  return list.filter((url) => typeof url === 'string' && url.length > 0);
+}
+
+/**
+ * 「在哪个地址监听」的可读标签。
+ *
+ * ⚠️ 通配地址必须翻译成**人话**：`在 0.0.0.0 监听` 对普通用户毫无意义，
+ * 而且会让人以为要往客户端里填 `0.0.0.0`。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayBindLabel(status) {
+  const address = status?.address;
+  if (!address) return '';
+  if (isWildcardHost(address.host)) return '在所有网卡监听';
+  return `在 ${address.host} 监听`;
+}
+
+/**
+ * 「允许局域网访问」开关下方的说明（按状态分支）。
+ *
+ * ⚠️ 纯文本，不得出现 `**`（见 {@link nonLoopbackNotice} 的同条理由）。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayLanSwitchHint(status) {
+  if (!status) return '正在读取网关状态…';
+  if (status.blockedByEnv) {
+    return '网关已被环境变量 DSH_OPENAI_GATEWAY_ENABLED 停用，本开关同样不会生效。';
+  }
+  if (status.lanAccess === true) {
+    if (!status.running) return '已开启（网关当前未在监听；启动后会绑定全部网卡）。';
+    if (gatewayLanUrls(status).length === 0) {
+      return '已开启，但未检测到可用的局域网地址（可能只有回环网卡）—— 网关仍会绑定全部网卡。';
+    }
+    return '已开启：同一网络内的其它设备可用下面的地址访问（仍需 API Key）。';
+  }
+  return '关闭时只监听本机回环 127.0.0.1（只有这台机器能调用）。'
+    + '开启后绑定全部网卡，同一网络内的手机 / 平板 / 其它电脑都能访问该端口'
+    + ' —— 隔离只靠 API Key，确实需要时再打开。';
+}
+
+/**
+ * 环境变量覆盖了开关时的提示（有则显示，无则空串）。
+ *
+ * 判据：开关开了、但实际绑的**不是**通配地址 ⇒ 只能是 `DSH_OPENAI_GATEWAY_HOST`
+ * 显式指定了某个接口（env 优先，见 `resolveHost`）。不说清的话，用户会以为
+ * 「开关坏了 / 没生效」。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayLanOverrideHint(status) {
+  if (status?.lanAccess !== true) return '';
+  const host = status?.address?.host;
+  if (typeof host !== 'string' || host.trim() === '' || isWildcardHost(host)) return '';
+  return `注意：检测到 DSH_OPENAI_GATEWAY_HOST=${host}，它优先于本开关 —— `
+    + '网关只绑定该地址，不会改为全部网卡。想让开关生效，请删除该环境变量。';
+}
+
+/**
+ * 切换局域网访问后的提示语。
+ *
+ * @param {object | null | undefined} result `gateway.setLanAccess` 的响应
+ * @param {boolean} next 用户想要的状态
+ * @returns {string}
+ */
+export function gatewayLanToggleNotice(result, next) {
+  if (next !== true) return '已关闭局域网访问：网关只监听本机回环 127.0.0.1。';
+  if (result?.running !== true) return '已开启局域网访问，但网关没有在监听（请检查端口是否被占用）。';
+  const urls = Array.isArray(result?.lanUrls)
+    ? result.lanUrls.filter((url) => typeof url === 'string')
+    : [];
+  if (urls.length === 0) return '已开启局域网访问（未检测到可用的局域网地址）。';
+  return `已开启局域网访问：${urls[0]}`;
 }
 
 /**
@@ -665,8 +767,9 @@ export function nonLoopbackNotice(status) {
   const address = status?.address;
   const host = typeof address?.host === 'string' && address.host.trim() !== '' ? address.host : '非回环地址';
   return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，`
-    + '此时同一容器网络内的其它容器与宿主都能连到这个端口。仅本机使用时把 '
-    + 'DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。';
+    + '此时同一容器网络内的其它容器与宿主都能连到这个端口。'
+    + '仅本机使用时：关掉「允许局域网访问」开关即可；'
+    + '若地址来自环境变量，则把 DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）。';
 }
 
 /**
@@ -694,8 +797,9 @@ export function gatewayFootnote(status) {
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
     return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，`
-      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
-      + '改回 127.0.0.1（或删除该环境变量）并重启。';
+      + '不要把它配置进任何浏览器端工具或扩展。'
+      + '仅本机使用时：把 DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量），'
+      + '或关掉「允许局域网访问」开关。';
   }
   return '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
     + '不要把它配置进任何浏览器端工具或扩展。';

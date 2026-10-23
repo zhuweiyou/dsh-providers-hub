@@ -19,6 +19,7 @@ import {
   sanitizeAggregateOrderMode,
   sanitizeDisabledModels,
   sanitizeGatewayEnabled,
+  sanitizeGatewayLanAccess,
   sanitizeNativeWebSearchEnabled,
   sanitizePermanentLocks,
   sanitizeProviderClosed,
@@ -60,6 +61,23 @@ describe('sanitizeGatewayEnabled', () => {
     expect(sanitizeGatewayEnabled('false')).toBe(true)
     expect(sanitizeGatewayEnabled(0)).toBe(true)
     expect(sanitizeGatewayEnabled({})).toBe(true)
+  })
+})
+
+describe('sanitizeGatewayLanAccess', () => {
+  it('⚠️ 方向与网关开关**相反**：只有显式 true 才算开启，缺键/脏值一律关闭', () => {
+    // 理由（2026-10-23 加「允许局域网访问」）：这是**暴露面**开关，失败方向不对称。
+    // - 网关开关丢键 ⇒ 网关没跑起来：可观测、点一下就好；
+    // - 局域网开关丢键 ⇒ 网关绑到全部网卡：暴露面扩大、**毫无提示**。
+    // ⇒ 缺键必须取更安全的一端（关闭），与 `sanitizeGatewayEnabled` 刻意相反。
+    expect(sanitizeGatewayLanAccess(true)).toBe(true)
+    expect(sanitizeGatewayLanAccess(undefined)).toBe(false)
+    expect(sanitizeGatewayLanAccess(null)).toBe(false)
+    expect(sanitizeGatewayLanAccess(false)).toBe(false)
+    // 字符串 / 数字 / 对象都不是用户点出来的值 ⇒ 不得当成「开」
+    expect(sanitizeGatewayLanAccess('true')).toBe(false)
+    expect(sanitizeGatewayLanAccess(1)).toBe(false)
+    expect(sanitizeGatewayLanAccess({})).toBe(false)
   })
 })
 
@@ -153,6 +171,8 @@ describe('老契约后端（SettingsStore）', () => {
       aggregateOrderMode: 'expiry',
       loomyPermanentLocked: false,
       gatewayEnabled: true,
+      // save 未携带暴露面开关 → 写出**关闭**（缺省），读回同值。
+      gatewayLanAccess: false,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
       nativeWebSearchEnabled: true,
       // save 未携带侧栏入口开关 → 写出显示（缺省），读回同值。
@@ -317,6 +337,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
       gatewayEnabled: true,
+      // 暴露面开关缺省**关闭** —— 方向与上面一行相反（见 sanitizeGatewayLanAccess）。
+      gatewayLanAccess: false,
       // 原生搜索开关缺省启用 —— 与升级前行为一致
       nativeWebSearchEnabled: true,
       // 侧栏入口开关缺省显示 —— 与升级前行为一致
@@ -655,6 +677,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,
+      // 暴露面开关同理：写盘时缺省即关闭（与上一行的方向相反），读回同值。
+      gatewayLanAccess: false,
       // 原生搜索开关同理：写盘时缺省即启用，读回同值。
       nativeWebSearchEnabled: true,
       // 侧栏入口开关同理：写盘时缺省即显示，读回同值。
