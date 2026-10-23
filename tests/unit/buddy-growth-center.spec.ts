@@ -13,6 +13,7 @@ import {
   fetchLotteryState,
   fetchStreakDetail,
   isBuddyAdoptNotReady,
+  listAllGrowthTasks,
   listGrowthTasks,
   makeupYesterday,
   redeemUnlockedTiers,
@@ -414,8 +415,66 @@ describe('listGrowthTasks（面板任务清单）', () => {
   })
 })
 
-describe('fetchBuddyInfo / 领养门槛', () => {
-  it('data.buddy 为 null ⇒ 还没领养', async () => {
+describe('listAllGrowthTasks（面板口径 = 三源并集）', () => {
+  it('小程序口径独有的码也要出现在面板清单里（否则用户以为任务做完了）', async () => {
+    const { fetcher } = routedFetcher([
+      {
+        match: (url) => url.includes('/v2/activity/growth/tasks'),
+        body: {
+          code: 0,
+          data: { tasks: [{ task_code: 'chat_5', title: '对话 5 次', accept_status: 'in_progress' }] },
+        },
+      },
+      {
+        match: (url) => url.includes('/activity/growth/tasks') && !url.includes('/v2/'),
+        body: { code: 0, data: { tasks: [] } },
+      },
+    ])
+    // 这个 fetcher 对 mp 头也回同一份（含 chat_5），故并集后仍只有 chat_5 ——
+    // 真正的 mp 专属码由下面这条用例覆盖（需要按头分派）。
+    const result = await listAllGrowthTasks(CRED, PRODUCT, fetcher)
+    expect(result.ok).toBe(true)
+    expect(result.tasks.map((task) => task.taskCode)).toEqual(['chat_5'])
+  })
+
+  it('按 X-Client-Platform 分派时，mp 专属码并入且标为「可自动」', async () => {
+    const calls: string[] = []
+    const fetcher = (async (url: string, init?: RequestInit) => {
+      const platform = String((init?.headers as Headers | undefined)?.get?.('x-client-platform') ?? '')
+      calls.push(`${String(url)}#${platform}`)
+      const isV2 = String(url).includes('/v2/activity/growth/tasks')
+      const isLegacy = String(url).includes('/activity/growth/tasks') && !isV2
+      let spec: unknown = { code: 0, data: { tasks: [] } }
+      if (isV2 && platform === 'miniprogram') {
+        spec = {
+          code: 0,
+          data: {
+            tasks: [{ task_code: 'Sequential_Tasks_1', title: '小程序首对话', accept_status: 'not_accepted', progress: { current: 0, target: 1 } }],
+          },
+        }
+      } else if (isV2) {
+        spec = { code: 0, data: { tasks: [{ task_code: 'chat_5', title: '对话 5 次', accept_status: 'in_progress' }] } }
+      } else if (isLegacy) {
+        spec = { code: 0, data: { tasks: [] } }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => spec,
+        text: async () => JSON.stringify(spec),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    const result = await listAllGrowthTasks(CRED, PRODUCT, fetcher)
+    expect(result.tasks.map((task) => task.taskCode).sort()).toEqual(['Sequential_Tasks_1', 'chat_5'])
+    const sequential = result.tasks.find((task) => task.taskCode === 'Sequential_Tasks_1')
+    expect(sequential?.reach).toBe('api')
+    expect(sequential?.progress).toBe('0/1')
+    // 确实打了两组头（web + miniprogram）
+    expect(calls.some((call) => call.endsWith('#miniprogram'))).toBe(true)
+  })
+})
+
+describe('fetchBuddyInfo / 领养门槛', () => {  it('data.buddy 为 null ⇒ 还没领养', async () => {
     const { fetcher } = routedFetcher([{ match: () => true, body: { code: 0, data: { buddy: null } } }])
     const info = await fetchBuddyInfo(CRED, PRODUCT, fetcher)
     expect(info.ok).toBe(true)

@@ -66,6 +66,7 @@ import {
   baseOf,
   claimBaseOf,
   classifyGrowthWrite,
+  fetchMpTaskItems,
   getGrowthJson,
   GROWTH_FIRST_BUDDY_PATH,
   GROWTH_TASK_COMPLETION,
@@ -1039,6 +1040,55 @@ export async function listGrowthTasks(
   return anyOk
     ? { ok: true, tasks }
     : { ok: false, tasks, message: lastMessage.length > 0 ? lastMessage : '任务列表查询失败' }
+}
+
+/**
+ * 拉取**全量**任务清单（web 两族 + 小程序口径的并集），供面板展示。
+ *
+ * ⚠️ 判据与 `buddy-growth.ts` 的 `fetchGrowthTaskCodes` / `listAllGrowthTaskCodes`
+ * **必须同源**（同样三源并集、同样按 task_code 去重）：面板少显示一源，用户就会
+ * 看到「任务做完了」而实际还有 `Sequential_Tasks_*` 没做 —— 正是「没地方看」的另一种形态。
+ */
+export async function listAllGrowthTasks(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<{ ok: boolean; tasks: GrowthOverviewTask[]; message?: string }> {
+  const web = await listGrowthTasks(credential, product, fetcher)
+  const seen = new Set(web.tasks.map((task) => task.taskCode))
+  const merged = [...web.tasks]
+  let anyMp = false
+  for (const item of await fetchMpTaskItems(credential, product, fetcher)) {
+    const taskCode = readString(item, 'task_code') || readString(item, 'code')
+    if (taskCode.length === 0 || seen.has(taskCode)) continue
+    seen.add(taskCode)
+    anyMp = true
+    const progress = typeof item['progress'] === 'object' && item['progress'] !== null
+      ? (item['progress'] as Record<string, unknown>)
+      : undefined
+    const current = progress !== undefined ? readNumber(progress, 'current') : readNumber(item, 'current')
+    const target = progress !== undefined ? readNumber(progress, 'target') : readNumber(item, 'target')
+    const credit = readNumber(item, 'reward_credit')
+    const energy = readNumber(item, 'reward_energy')
+    const rewardParts: string[] = []
+    if (credit > 0) rewardParts.push(`+${credit} 积分`)
+    if (energy > 0) rewardParts.push(`+${energy} 能量`)
+    const status = readString(item, 'accept_status') || readString(item, 'status')
+    merged.push({
+      taskCode,
+      title: readString(item, 'title') || taskCode,
+      reward: rewardParts.join(' '),
+      progress: target > 0 ? `${current}/${target}` : '',
+      status,
+      reach: GROWTH_TASK_COMPLETION[taskCode] !== undefined ? 'api' : 'unknown',
+      ...target > 0 && current >= target && status !== 'claimed' ? { claimable: true } : {},
+    })
+  }
+  return {
+    ok: web.ok || anyMp,
+    tasks: merged,
+    ...!web.ok && !anyMp ? { message: web.message ?? '任务列表查询失败' } : {},
+  }
 }
 
 /**

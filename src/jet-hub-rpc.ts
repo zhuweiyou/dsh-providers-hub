@@ -24,7 +24,7 @@ import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oau
 import { collectBuddyGrowth } from './buddy-growth.js'
 import {
   fetchGrowthCenterSnapshot,
-  listGrowthTasks,
+  listAllGrowthTasks,
 } from './buddy-growth-center.js'
 import { growthRunOf } from './growth-run-log.js'
 import type { BuddyCredential } from './buddy.js'
@@ -6605,7 +6605,7 @@ function registerJetHubEndpoints(
               continue
             }
             const snapshot = await fetchGrowthCenterSnapshot(credential, CODEBUDDY)
-            const tasks = await listGrowthTasks(credential, CODEBUDDY)
+            const tasks = await listAllGrowthTasks(credential, CODEBUDDY)
             const ok = snapshot.ok || tasks.ok
             const errors: string[] = []
             if (!snapshot.ok && snapshot.message !== undefined) errors.push(snapshot.message)

@@ -50,8 +50,7 @@
  */
 
 import { CLINE } from './cline-product.js'
-import { collectBuddyGrowth } from './buddy-growth.js'
-import { reportGrowthActivity } from './buddy-growth.js'
+import { collectBuddyGrowth, reportGrowthActivity } from './buddy-growth.js'
 import {
   runGrowthCenterDaily,
   summarizeGrowthExtras,
