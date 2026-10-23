@@ -22,12 +22,13 @@ git log <上次基点>..upstream/master --no-merges --date=short \
 | 同步日期 | 上游基点 commit | 上游 commit 时间 | 本地同步提交 | 备注 |
 |---|---|---|---|---|
 | 2026-10-23 | `24e3988` | 2026-10-23T18:31:22+08:00 | `51a33e8`（`feat/sync-upstream`） | codely 渠道 / codearts 识图 / minimax 账号真名；未跟 `d5f5ac6`（共享骨架 refactor，行为等价） |
+| 2026-10-24 | `a777741` | 2026-10-23T22:42:50+08:00 | `c7bf996`（`feat/sync-upstream-2`） | 只补「我们实现错/缺的」：analyzeImage 作用域摘除（813e7fa 半条）+ zcode 待生效额度（b24514b）+ 签到并入营销投放（689a2b1）+ `.gitattributes` 规则；未跟 `f41036b`（纯文档）、`040a8af` 的全仓行尾重写（我们已是 LF） |
 
 ## 下次同步的起手式
 
 ```bash
 git fetch upstream --prune
-git log 24e3988..upstream/master --no-merges --pretty='%h %ad %s' --date=iso-strict
+git log a777741..upstream/master --no-merges --pretty='%h %ad %s' --date=iso-strict
 ```
 
 - 只取**修复 / 新增 / 更新**；上游的**删除一律不跟**（渠道、`src/` 文件、接线、测试键）。
