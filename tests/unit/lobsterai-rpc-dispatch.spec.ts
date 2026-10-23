@@ -113,10 +113,11 @@ describe('account.refresh 分派（T7 回归）', () => {
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     // ⚠️ 2026-10-22 合并上游后补回 buddy / workbuddy：20 → 22（去豁免仍 20）。
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(20)
+    ).toHaveLength(21)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

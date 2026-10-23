@@ -873,6 +873,89 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'codely',
+    label: 'Codely (Unity)',
+    displayName: 'Codely (Unity)',
+    logoClass: 'codely',
+    // ⚠️⚠️ **登录已接线、推理链路未接的过渡态（2026-10-19）**：「新建账号」走
+    //    设备码轮询（`src/codely-auth.ts`，与 Qoder / Cline 同款两步式，凭据落
+    //    `CODELY_ACCOUNT_*`），**聊天 / 模型目录 / 续期尚未接线**。协议已从官方
+    //    VS Code 插件 4.3.0 逆向 + 无凭据实探：
+    //    - 设备码登录三步（已实测 200）：
+    //      `POST /auth/device/initiate` `{provider:'unity', client_name:'codely-vscode',
+    //      auth_from:'vscode-codely'}` → `{auth_request_token, user_code,
+    //      verification_uri(_complete), interval:2, expires_in:900}`；
+    //      `GET /auth/device/poll?auth_request_token=…` → pending 形状
+    //      `{status:'pending', error:'authorization_pending', interval:2}`，
+    //      状态机 `pending|slow_down|authorized(+authorization_code)|completed|denied|expired`
+    //      （官方插件源码逐分支）；`POST /auth/device/exchange` `{authorization_code}`
+    //      → `{access_token, refresh_token}`（插件源码）。
+    //    - 刷新：`POST /auth/refresh` `{refresh_token}`（插件源码；**刻意未实现**，
+    //      理由见 codely-auth.ts 模块头「为什么暂不实现 refresh」）。
+    //    - 鉴权头：`Authorization: Bearer` + `X-User-Agent: codely-vscode/<ver>`（插件源码）。
+    //    - 聊天：`POST /v1/chat/completions`（存在性已由 401/405 实测确认，报文未验证）。
+    //    - 余额/积分：`/api/user/usage/summary`、`/api/points/check-in`（端点存在，未验证）。
+    //
+    //    ## 剩余接线清单（缺一处即静默失效，AGENTS.md 有先例）
+    //    ① 本条 `channel` 改 `true`；② 删掉 `rateLimit: false`（恢复默认 true）并按实测
+    //    决定 `credits.balance`；③ `src/index.ts`：import + `new CodelyAuth` +
+    //    `registerCodelyLlm` + auth 注册表数组 + `JetHubAuths`（jet-hub-rpc.ts）加 `codely`
+    //    键 + `refreshAccountCredential`（用 `/auth/refresh`）+ 适配器（chat/catalog）；
+    //    ④ `AGGREGATE_CHANNELS`（aggregate-adapter.ts）；⑤ `SELF_HEAL_REFRESHABLE_PROVIDERS`
+    //    （jet-hub-rpc.ts）；⑥ 测试侧：jet-hub-rpc-auth-wiring.spec.ts 的 `AUTH_SERVICE`
+    //    表与计数、zcode-wiring.spec.ts 的豁免数组、tests/helpers/rpc-refresh.ts 的
+    //    `REFRESH_PROVIDERS`、provider-registry.spec.ts 的 channel 计数与 rateLimit 清单、
+    //    credits-capabilities.spec.ts 的限流清单。
+    //    ⚠️ `REF_PREFIX_TO_PROVIDER`（jet-hub-store.ts）的 `CODELY` 前缀**本条已提前登记**
+    //    （恢复表守卫按全量 registry 派生，channel:false 也逃不掉）。
+    //
+    //    ## 接线进度（2026-10-20）
+    //    ⓪ 推理 ✅：**驱动官方 CLI 子进程**（签名密钥未取得，让官方客户端自己
+    //       签名 —— 详见 `codely-adapter.ts` / `codely-cli.ts` 模块头）；端到端
+    //       实测 4.0s 拿到非空 chunk（`codely-basic` 回复 "hello there"）。
+    //    ① `channel: true` ⏸ **暂缓**（本行，2026-10-20）；✅ `rateLimit` 已于同日
+    //       恢复缺省 true（换号 + 探测接线完成，见 `channel: false` 下方的说明）。
+    //    ② `/auth/refresh` **端点已实测**（200、`refresh_token` 不轮换），实现待补。
+    //    ③④⑤⑥ 见上方清单。
+    //
+    /**
+     * ✅ `channel: true`（2026-10-22 A6 翻正）。
+     *
+     * ## 为什么原来是 `false`，现在为什么能翻
+     *
+     * 原注释写的是「推理已通但 `channel: true` 会点燃 9 个 spec / 11 条派生登记，先补齐再翻」。
+     * ⚠️⚠️ 但那是**流程理由，不是产品理由** —— 2026-10-22 对抗审计指出：
+     * `channel` 在**生产代码里零个读取点**（全仓普查，唯一消费者是 tests/），
+     * 而 `false` 造成两个**用户可见**缺口：
+     * - 它的模型**永不进聚合目录与轮换候选**（`AGGREGATE_CHANNELS` 缺它）；
+     * - `credits-balance-self-heal.spec.ts` 用 `d.channel && d.credits.balance` 派生期望集合
+     *   ⇒ codely 被**自动豁免**，那条专为「漏登记」而建的守卫对它**永不会红**。
+     *
+     * ⇒ 本次同步补齐全部派生登记（接线已完成：推理 / 目录 / 余额 / 签到 / 续期）：
+     * `SELF_HEAL_REFRESHABLE_PROVIDERS`、`JetHubAuths.codely`、`AGGREGATE_CHANNELS`、
+     * `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()`、`modelAdapters`、以及四张 spec 的计数。
+     *
+     * ⚠️ **聚合轮换还差一块真实的东西**：Codely 的余额端点**不下发任何到期时间**
+     * （`/api/user/usage/summary` 只有 `remaining_points` / `is_exhausted`；抽象成
+     * `CreditPackage` 时 `expiredTime` 是**空串**—— 见 `codely-credits.ts`）。
+     * 而聚合候选表的第一判据就是「临期档」。⇒ 本次**不把它加进**
+     * `WIRED_EXPIRY_PROVIDERS`，理由是**上游没有这个数据**（不是「没接」），
+     * 并在 `expiry-runtime-parity.spec.ts` 的豁免表逐字登记。
+     * ⚠️ 上游一旦开始下发到期时间，只需补一个折算原语 + 两处登记。
+     */
+    channel: true,
+    // ✅ `rateLimit` 缺省 true：请求级换号 + 冷却已接（`codely-adapter.ts` 的
+    //    `updateModelRateLimit` 写点：402/预算耗尽 → UTC+8 次日 0 点、429 → 1h），
+    //    `probeById.codely` 探测适配器同步挂上 ⇒「重测 / 重置」有真实作用对象。
+    // ✅ `credits.balance: true`（2026-10-19 真凭据实测）：余额端点
+    //    `GET /api/user/usage/summary` → `{remaining_points:"2400", is_exhausted:false, details:[…]}`
+    //    —— ⚠️ 数字是**字符串**。原语在 `src/codely-credits.ts`。
+    // ✅ `dailyCheckin: true`（2026-10-20 真凭据实测接通）：两步端点
+    //    `POST /api/points/check-in/init`（查状态）→ `POST /api/points/check-in`（执行）；
+    //    幂等判据是 `init` 的 `can_check_in`。原语 `claimCodelyDailyCheckIn`。
+    credits: { balance: true, dailyCheckin: true },
+  },
+  {
     id: 'aggregate',
     label: '聚合 (跨渠道)',
     displayName: '聚合 (跨渠道)',

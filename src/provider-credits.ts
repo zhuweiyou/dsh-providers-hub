@@ -80,6 +80,10 @@ import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
 import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
+// ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额原语。
+// 2026-10-20 起接每日签到（`/api/points/check-in`，实测 200）。
+import { claimCodelyDailyCheckIn, fetchCodelyBalanceDetailed } from './codely-credits.js'
+import type { CodelyCredential } from './codely-auth.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
@@ -403,6 +407,39 @@ export function createProviderCredits(
     modelscope: {
       fetchBalanceDetailed: async (credential) =>
         fetchModelscopeBalanceDetailed(credential as ModelscopeCredential, MODELSCOPE),
+    },
+
+    /**
+     * Codely（Unity 团结引擎）：**本 fork 独有**（2026-10-19 接入积分余额）。
+     *
+     * 真端点 `GET /api/user/usage/summary`（Bearer + X-User-Agent），实测 200
+     * 返回 `remaining_points:"2400"` —— ⚠️ 数字是**字符串**，解析在
+     * `fetchCodelyBalanceDetailed` 内（string | number 双形态）。
+     *
+     * ⚠️ registry 里 `channel:false` 但 `balance:true` —— 这是全仓第一例
+     * 「有余额能力、无 auth 服务」的组合：登录走设备码纯函数（无 XxxAuth）、
+     * 余额原语是自由函数，二者都不需要 auth 实例。它**不**违反
+     * `provider-runtime-wiring.spec.ts` 那条「balance ⇒ runtime.credits」守卫 ——
+     * 该守卫只检查**已注册 runtime** 的渠道，codely 没有 runtime（无 adapter）
+     * 而被跳过；端点侧的表（`jet-hub-rpc.ts` 的 `createProviderCredits`）
+     * 不依赖 runtime。
+     */
+    codely: {
+      fetchBalanceDetailed: async (credential) =>
+        fetchCodelyBalanceDetailed(credential as CodelyCredential),
+      /**
+       * 每日签到（2026-10-20 实测接通）：两步端点
+       * `POST /api/points/check-in/init` → `POST /api/points/check-in`，
+       * 幂等判据在 `init` 的 `can_check_in`，**内部自带状态预检** ⇒
+       * `precheckStatus: false`（与 autoclaw / codearts 同因：外部再查一次
+       * 属于重复请求，且骨架默认的 buddy 式 `fetchCheckinStatus` 打它的端点
+       * 必然失败 —— 那是一次发错端点的真实上游请求）。
+       *
+       * ⚠️ 网页 dashboard 同款流程；官方 CLI 二进制里没有签到调用（它只管
+       * 推理/余额），端点来源是网页 SPA bundle —— 见 `codely-credits.ts`。
+       */
+      claim: (credential) => claimCodelyDailyCheckIn(credential as CodelyCredential),
+      precheckStatus: false,
     },
 
     /**

@@ -97,6 +97,12 @@ export const REFRESH_PROVIDERS = [
   //    —— 没有 refresh 端点，但 `refreshAccountCredential` 仍按统一接口做
   //    有效性对账并回写池内 `expiresAt`）。
   'modelscope',
+  // ⚠️ **Codely**（Unity，2026-10-22 A6）：有真实 refresh 端点（`POST /auth/refresh`，
+  //    实测 200 且 `refresh_token` 不轮换），`refreshAccountCredential` 续期并回写凭据 +
+  //    池内 `expiresAt` ⇒ 不属 loomy / zcode 那类豁免。
+  //    ⚠️ 它之前不在本表里，理由是当时 `CodelyAuth.refreshAll` **2 参、对不上契约**
+  //    （TS2322）⇒ 接不上。现已改成单参并真接（见 A5）。
+  'codely',
 ] as const
 
 /**

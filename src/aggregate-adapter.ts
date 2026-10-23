@@ -1388,6 +1388,14 @@ export class AggregateAdapter extends LlmAdapter {
     //    是 `WIRED_EXPIRY_PROVIDERS` —— 本文件有 4 处按它过滤。用户报障
     //    「astudio 缺永久/长期/临期三档」的直接成因之一就是这条「有意不接入」。
     'astudio',
+    // ⚠️ **Codely**（Unity，2026-10-22 A6）：推理 / 目录 / 余额 / 签到 / 续期全部已接线，
+    //    `channel` 已翻 `true` ⇒ **必须进本数组**，否则它的模型**永不进聚合目录**。
+    //    ⚠️ 但**不进** `WIRED_EXPIRY_PROVIDERS`：它的余额端点**不下发任何到期时间**
+    //    （`expiredTime` 是空串），而候选表的第一判据就是临期档 ⇒ 它的候选
+    //    会被那 4 处 `WIRED_EXPIRY_PROVIDERS` 过滤剔掉（**与 minimax 系列当前行为一致**）。
+    //    ⇒ 目录层有它、轮换候选层没它；上游一旦开始下发到期时间，
+    //    补一个折算原语 + 两处登记即可。
+    'codely',
   ])
 
   /**

@@ -288,6 +288,11 @@ export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   //    它**曾**登记为「不写标记」，而那正是本 issue 的成因之一：换号接上后若漏本行，
   //    标记写进去却永远清不掉 —— 与 minimax / modelscope 完全同型。
   'accio',
+  // ⚠️ **本 fork 独有**（codely，2026-10-20）：接上请求级换号 + 冷却
+  //  （`codely-adapter.ts` 的 `updateModelRateLimit` 写点：402/预算耗尽 →
+  //  UTC+8 次日 0 点、429 → 1h；探测适配器已挂 `probeById.codely`）。
+  //  漏登记 = 标记写进去却永远清不掉（minimax / modelscope 同型）。
+  'codely',
 ])
 
 /** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */

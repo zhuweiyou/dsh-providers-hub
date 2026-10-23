@@ -91,6 +91,10 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名同理由派生 ⇒ `modelscopeAuth`。
   //    该名字由 `provider-runtime-wiring.spec.ts` 的真跑 `apply()` 探针独立验证过。
   modelscope: 'modelscopeAuth',
+  // ⚠️ Codely（Unity，2026-10-22 A6）：服务名 `codelyAuth`（全小写，与 provider id 同形）。
+  //    ⚠️ `CodelyAuth` 已从裸类改为 `extends Service`（否则 ctx 上永远没有
+  //    `codelyAuth`，本表取不到实例）—— 见 `codely-auth-service.ts` 的类注释。
+  codely: 'codelyAuth',
 }
 
 /**
@@ -253,7 +257,25 @@ async function setup(accounts: ProviderAccountEntry[]): Promise<{
    */
   const settleBackground = async (): Promise<void> => {
     // 让出若干拍：首轮链有多个 `await`（读池 → 逐账号续期 → 兜底）。
-    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+    // ⚠️⚠️ 2026-10-22（A6）：**固定拍数已不可靠** —— 改成「轮询到静默」。
+    //
+    // 原写法是 5 拍（后来加到 12），它隐含一个假设：「背景链的 await 次数固定」。
+    // 而 codely 加入后它不再成立：每家的 `refreshAll` 都会“读池 → **逐账号 `await`** → 写回”，
+    // 拍数与**账号数×家数** 成正比 ⇒ 任何固定值都是“恰好够”的幸存，
+    // 下一次加 provider / 加账号就会重新渗到测量区，表现为**假错位**
+    // （实测先报 minimax 、拍数加大后又报 buddy）。
+    //
+    // ⇒ 判据改成：**轮询直到连续 N 拍没有新调用**才算背景链跑完，
+    //   然后清零记录。它不依赖「链有多长」，只依赖「它有没有停」。
+    //   ⚠️ 不得改成「只断言列表包含**自己**」—— 那会连真正的错位一起放过。
+    let quiet = 0
+    let lastLen = -1
+    // 上限 200 拍（防死循环；成本是微任务循环，实测远小于此）。
+    for (let i = 0; i < 2000 && quiet < 20; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      if (called.length === lastLen) quiet += 1
+      else { quiet = 0; lastLen = called.length }
+    }
     called.length = 0
   }
   await settleBackground()
@@ -297,8 +319,8 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
-    // ⚠️ 2026-10-22 合并上游后补回 buddy / workbuddy（本仓库保留的渠道）：20 → 22。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 已接入 auth（`CodelyAuth` 改为 Service + 接进 auths）：20 → 21。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(21)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

@@ -115,6 +115,23 @@ export function userContentParts(
         : { type: 'image_url', image_url: { url } })
       continue
     }
+    // ⚠️⚠️ **已经拼好的 `image_url` 块必须原样透传**（2026-10-22 真实缺陷）。
+    //
+    // 背景：`analyzeImage` 的识图请求由**插件自己**构造（不是 harness 派生历史），
+    // 它把图片直接拼成上游要的 `{type:'image_url', image_url:{url}}` 形态后交给
+    // `adapter.stream()`。而本函数此前**只认 harness 原生** `{type:'image',
+    // attachment}`（`imageUrls` 里查字节），对 `image_url` **零命中** ⇒ 该块被
+    // **静默丢弃** ⇒ VL 模型只收到文字 ⇒ 回答「我看不到图片」。
+    // 症状极具误导性：HTTP 200、正文正常、上游无报错，只有答案是错的。
+    // ⇒ 修法：认到 `image_url` 就原样放进 parts（它已经是目标形态，无需再转）。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
+      continue
+    }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
       const inner = userContentParts(block.content, imageUrls)
       if (inner !== undefined) {
@@ -250,7 +267,16 @@ export function serializeMessages(
     // 工具结果之外的常规内容（含顶层图片）。
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
-    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    // ⚠️⚠️ **不能只在 `imageUrls !== undefined` 时才走多模态**（2026-10-22 真实缺陷）：
+    // 插件自己构造的识图请求（`analyzeImage`）把图**直接拼成 `image_url` 块**，
+    // 且**没有** `imageUrls` 映射表 ⇒ 若这里仍按「有表才升级」，那些块永远走不到
+    // `userContentParts` ⇒ 被当成纯文本消息发出 ⇒ **图被静默丢弃**。
+    // ⇒ 判据改为「有映射表 **或** 内容里本来就带 `image_url` 块」。
+    const carriesInlineImage = regular.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(regular, imageUrls ?? new Map())
     // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点）：
     // 无工具结果 → 立刻发出并让挂起图片搭车；含工具结果 → 整条延后到下一条
     // user 消息（tool 消息必须紧跟其 assistant `tool_calls`，中间插消息会 400）。

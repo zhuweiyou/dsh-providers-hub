@@ -135,6 +135,9 @@ import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
+import type { CodelyAuth } from './codely-auth-service.js'
+import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
+import { CODERLY } from './codely-product.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 // ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
 //    判合法性（非法即不写），否则「先写后判」会静默清掉用户原有的有效设置。
@@ -1622,6 +1625,16 @@ export interface JetHubAuths {
    * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
    */
   readonly minimaxintl: MinimaxAuth
+  /**
+   * Codely（Unity）的续期实例 —— **可选键**（2026-10-22 A6 接线）。
+   *
+   * ⚠️ 为何是**可选**而不是必填：它的接线需要同时改到 `index.ts` 的
+   * `auths` 对象、`SELF_HEAL_REFRESHABLE_PROVIDERS`、`jet-hub-store.ts` 的前缀表，
+   * 以及多张从注册表派生的守卫。写成**必填**会让下一个加 provider 的人
+   * 被迫同时改所有消费方（而那些消费方本来就应该按 `channel` 派生）。
+   * 缺它时：存在的 `refreshAccountCredential` / `refreshAll` 路径会跳过 codely（与各家同形）。
+   */
+  readonly codely?: CodelyAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
   /**
@@ -2528,6 +2541,14 @@ function registerJetHubEndpoints(
     //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
     //    只需一次 refresh，且**日志零字**。
     AUTOCLAW_INTL.id,
+    // ⚠️⚠️ codely（Unity，2026-10-22 A6 接线）：**有**真实 refresh 端点
+    //    `POST /auth/refresh {refresh_token}`（实测 200，且 `refresh_token` **不轮换**）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    凭据形态：`access_token` 是 JWT（实测寿命约 365 天）+ `refresh_token`，
+    //    与各家同形 ⇒ 过期后靠本表自愈，而不是用户手动重登。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    CODERLY.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -4065,6 +4086,40 @@ function registerJetHubEndpoints(
             void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
           }
         }
+        // ⚠️ **Codely 自愈回填**（2026-10-19，OfficeAce 同款「列表时补算」）：
+        //    `expiresAt` 回填是修复「卡片恒显示未知」时加的，修复前登录的
+        //    池条目缺这个字段（凭据里也没有 `expires_at`）。判据有两层：
+        //    ① 新凭据（修复后落盘）带 `expires_at`（ISO 字符串）⇒ 直接解析；
+        //    ② 旧凭据（修复前落盘）没有该字段 ⇒ 解码 access_token 的 JWT
+        //       `exp`（上游自己签发的权威过期时刻，不是猜测）。
+        //    两层都拿不到才跳过（绝不写 NaN / 0，那会让卡片显示「已过期」）。
+        // ⚠️ 与 OfficeAce 同款纪律：**逐账号按自己的 ref resolve**（多账号
+        //    广播 = A 的有效期显示成 B 的，本仓库已复发过 7 次的那类错位）。
+        if (req.provider === CODELY_PROVIDER_ID && accounts.some((a) => a.expiresAt === undefined)) {
+          for (const account of accounts) {
+            if (account.expiresAt !== undefined) continue
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => null)
+            if (!resolved) continue
+            let expiresAt = Number.NaN
+            try {
+              const credential = JSON.parse(resolved.value) as { expires_at?: unknown; access_token?: unknown }
+              if (typeof credential.expires_at === 'string') {
+                expiresAt = Date.parse(credential.expires_at)
+              }
+              // 旧凭据没有 expires_at：退回解码 access_token 的 JWT exp。
+              if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
+                const decoded = typeof credential.access_token === 'string'
+                  ? decodeCodelyJwtExpMs(credential.access_token)
+                  : undefined
+                if (decoded !== undefined) expiresAt = decoded
+              }
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
+            account.expiresAt = expiresAt
+            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
@@ -4135,6 +4190,19 @@ function registerJetHubEndpoints(
           // 便执行 `window.location.href = loginUrl`，把整个设置页跳走
           // ——用户报的「主页面直接跳转过去了」正是此因。
           const started = await codearts.startLogin({ refName })
+          // ⚠️ **宿主侧直接拉起无痕窗口**（2026-10-21，用户报障）：
+          //    华为 authui 会静默复用浏览器已有会话 ⇒ 带 cookie 打开授权页
+          //    看不到登录框 ⇒ 「新建账号」永远只能建出同一个号。无痕窗口是
+          //    全新 cookie jar，天然无会话，且**不碰用户日常浏览器里的
+          //    华为云控制台会话**（对比 `authui/logout`：它的作用域是整个域，
+          //    会连带登出控制台）。实测依据见 `login.ts` 的 `openIncognitoWindow`。
+          //
+          // ⚠️ 客户端**无法**自己做这件事：`window.open` 不能请求无痕模式
+          //    （那是进程级启动参数），故必须由宿主 `spawn` 浏览器可执行文件。
+          //
+          // ⚠️ 打开失败（读不到默认浏览器 / spawn 失败）时返回 `false`，
+          //    客户端据此回退到自己的 `window.open` —— 保持原行为不变。
+          const incognitoOpened = openIncognitoWindow(started.loginUrl)
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
@@ -4162,7 +4230,7 @@ function registerJetHubEndpoints(
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
-          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl, incognitoOpened } }
         } else if (provider === LOBSTERAI.id) {
           // LobsterAI 与 codearts 同款：回调式登录 + 两步式返回，
           // 理由见上面的 codearts 分支（弹窗拦截导致主页面被跳转）。
@@ -4466,19 +4534,29 @@ function registerJetHubEndpoints(
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
              *
-             * ⚠️ **国内站逐字节保持原行为**（`result.accountId` 对真实凭据恒
-             * `undefined` ⇒ 退化为 `id`）：改它会让存量用户的账号名变化。
-             * 国际站是**新增**的，加标记不构成行为回退。
+             * ## ⚠️⚠️ 2026-10-23（Gitee IKP8UA）：昵称来源已改为**真身份查询**
+             *
+             * 原实现在这里退化成内部 id，理由写的是「`accountId` 对真实凭据恒
+             * `undefined`，这是预期行为」—— 那句话说对了一半：`access_token`
+             * 确实**不是 JWT**（`mmoat_` 前缀、60 字符、0 个点，`decodeJwtSub` 恒空），
+             * 但**账号名是拿得到的**（`GET /v1/api/user/info`，真机实测两站都有）。
+             * ⇒ 「已知拿不到身份」的正确处置是**另找来源**，而不是把内部 id 当展示名。
+             *
+             * 现在身份由 `persistLogin` 内部查询并回传（`result.nickname`），
+             * 登录路径与启动自愈共用那一份实现。
+             *
+             * 三级回退（**顺序不可颠倒**）：
+             * ① `result.nickname`（真身份，最常见）；
+             * ② 老形态的 `accountId`（万一上游改发 JWT）；
+             * ③ 内部 id（含国际站的 `MiniMax 国际版` 前缀，与既有口径一致）。
              */
-            const nickname = result.accountId === undefined
-              ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
-              : `MiniMax ${result.accountId.slice(0, 8)}`
+            const nickname = result.nickname
+              ?? (result.accountId === undefined
+                ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
+                : `MiniMax ${result.accountId.slice(0, 8)}`)
             await pool.updateAccount(id, {
-              // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
-              // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
-              // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
-              // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
-              // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
+              // ⚠️ `result.accountId` 对真实凭据**恒为 `undefined`**（token 非 JWT），
+              // 故实际生效的是 `result.nickname` 或内部 id。
               nickname,
               // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
               // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
@@ -5023,6 +5101,65 @@ function registerJetHubEndpoints(
             })
 
           return { ok: true, value: { accountId: id, loginUrl: astudioStarted.loginUrl } }
+        } else if (provider === CODELY_PROVIDER_ID) {
+          // Codely（Unity 团结引擎）是**设备码轮询**登录（与 Qoder / Cline 同款：
+          // 不开本地回调服务器，用户在浏览器完成 Unity 账号授权）。
+          // 协议三步：initiate → poll（status 状态机）→ exchange，
+          // 证据与字段名见 `src/codely-auth.ts` 的模块头（2026-10-19 实测/逆向）。
+          //
+          // ⚠️ 两步式（先返回 loginUrl 再后台轮询）理由与 codearts 同款：
+          //    `window.open` 只在用户手势窗口内有效。loginUrl 用
+          //    `verification_uri_complete`（带 user_code，用户免手输）。
+          //
+          // ⚠️ **本分支没有 XxxAuth 服务**（registry 里 codely `channel:false`、
+          //    `JetHubAuths` 无键）：登录本身不依赖 auth 服务，直接调
+          //    `startCodelyDeviceLogin` 纯函数，凭据也由它落盘（传完整 ref）。
+          //    接线清单见 `provider-registry.ts` 里 codely 条目的注释。
+          const started = await (async () => {
+            try {
+              return await startCodelyDeviceLogin({
+                ref: credentialRef(refName),
+                credentials: ctx.credentials,
+              })
+            } catch (error) {
+              // initiate 本身就失败（网络不可达 / 服务端异常）：此时占位条目
+              // **尚未登记**，直接报错即可，不留任何需要清理的中间态。
+              // 文案点明 provider，排障者不用猜是哪一跳失败（与 codearts /
+              // accio 分支的包装同款）。
+              const reason = error instanceof Error ? error.message : String(error)
+              throw new Error(`无法启动 Codely 登录（设备码授权请求失败）：${reason}`)
+            }
+          })()
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称等真实字段。
+          await pool.addAccount({
+            id,
+            provider: CODELY_PROVIDER_ID,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            await pool.updateAccount(id, {
+              nickname: loginResult.nickname !== undefined && loginResult.nickname.length > 0
+                ? loginResult.nickname
+                : id,
+              // ⚠️ access_token 的 JWT `exp`（见 decodeCodelyJwtExpMs）——
+              //    缺省时**不写**（卡片如实显示「未知」，不编造过期时间）。
+              ...(loginResult.expiresAt === undefined ? {} : { expiresAt: loginResult.expiresAt }),
+              // ⚠️ `refreshable` 刻意恒 false：`account.refresh` 的分派查
+              //    `authOf(auths, 'codely')`（`JetHubAuths` 的键），现在没有 ——
+              //    置 true 会让续期按钮发出必然报「不支持续期」的请求。
+              //    适配器接线、`JetHubAuths` 加键时一并改（见 registry 注释清单）。
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background codely login failed for ${id}: ${String(error)}`)
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
