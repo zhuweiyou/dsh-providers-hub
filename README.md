@@ -4,6 +4,8 @@ DeepSeek Harness 插件：把多家 AI 编程服务的账号统一接进 DSH 的
 
 > 本项目基于 [iJetLi/deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts) 分叉二次开发。
 
+<img width="842" height="838" alt="image" src="https://github.com/user-attachments/assets/51a01136-975a-4ea5-aa96-783d9c003347" />
+
 ## 安装
 
 ```sh
@@ -30,18 +32,25 @@ dsh plugin --profile <name> add dsh-providers-hub
 
 | 服务 | 渠道 id |
 |---|---|
-| CodeBuddy（腾讯） | `buddy`、`workbuddy`（国际版） |
-| 华为云 CodeArts / OfficeAce | `codearts`、`officeace` |
-| Qoder | `qoder`、`qodercn` |
-| MiniMax Code | `minimax`、`minimaxintl` |
-| AutoClaw（智谱） | `autoclaw`、`autoclawintl` |
+| CodeBuddy（腾讯） | `buddy` |
+| WorkBuddy（国际版） | `workbuddy` |
+| CodeArts（华为云） | `codearts` |
+| OfficeAce（华为云） | `officeace` |
+| Qoder | `qoder` |
+| Qoder（中国版） | `qodercn` |
+| MiniMax Code（中国版） | `minimax` |
+| MiniMax Code（国际版） | `minimaxintl` |
+| AutoClaw（智谱） | `autoclaw` |
+| AutoClaw（国际版） | `autoclawintl` |
 | 智谱 ZCode | `zcode` |
 | 字节 TRAE | `trae` |
 | 有道 LobsterAI | `lobsterai` |
-| 讯飞 Loomy / AStudio | `loomy`、`astudio` |
+| 讯飞 Loomy | `loomy` |
+| 讯飞 AStudio | `astudio` |
 | 商汤 Raccoon Work | `raccoon` |
 | 阿里 Accio | `accio` |
-| Cline / OpenCode | `cline`、`opencode` |
+| Cline | `cline` |
+| OpenCode | `opencode` |
 | Gemini Code Assist | `gemini` |
 | 魔搭 ModelScope | `modelscope` |
 
