@@ -2191,6 +2191,110 @@ export interface RpcBuddyGrowthAccountResult {
   tasks: RpcBuddyGrowthTaskResult[]
   /** 执行失败原因（凭据失效、任务列表查询失败等）。 */
   error?: string
+  /**
+   * 成长中心**扩展收益**（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）的逐项结果。
+   *
+   * ⚠️ 与 `tasks` **并列**而不是折进 `message`：这批动作与「任务」是两条独立
+   * 收益链（纯 RPC 发放，不需要行为事件），混进一句文案就看不出「哪一项给了多少」
+   * —— 而那正是用户问「点了做任务到底领到什么」时唯一能回答的东西。
+   *
+   * 缺字段 = 本轮未执行扩展收益（时间预算用尽 / 非 buddy / 旧版本）。
+   */
+  extras?: RpcBuddyGrowthExtras
+}
+
+/** 成长中心扩展收益的**单步**结果。 */
+export interface RpcBuddyGrowthStep {
+  /** `true` = 本次真的到账 / 推进了。 */
+  ok: boolean
+  /** 给用户看的一句话（保留上游原文）。 */
+  message: string
+  /** `true` = 结构上不适用（无猫、无补签卡、无抽奖次数…），UI 不该染红。 */
+  skipped?: boolean
+}
+
+/** 成长中心扩展收益的整体结果（字段顺序即执行顺序）。 */
+export interface RpcBuddyGrowthExtras {
+  /** 新手礼包（一次性，已领归 `skipped`）。 */
+  gift?: RpcBuddyGrowthStep & { credit?: number }
+  /** 补签（昨日漏签 + 有卡才动）。 */
+  makeup?: RpcBuddyGrowthStep
+  /** 连登档位兑换。 */
+  streak?: RpcBuddyGrowthStep & { days?: number; redeemed?: string[] }
+  /** 抽奖（按 `chances` 抽，有上限）。 */
+  lottery?: RpcBuddyGrowthStep & { chances?: number; drawn?: number }
+  /** 猫猫旅行（每日一段）。 */
+  travel?: RpcBuddyGrowthStep & { action?: string; credit?: number }
+  /** 领养首只 Buddy（+300，一次性）。 */
+  adopt?: RpcBuddyGrowthStep
+}
+
+/** RPC: 成长中心**只读总览**（面板「有地方看」的数据源，不发任何写请求）。 */
+export interface RpcBuddyGrowthOverviewRequest {
+  /** 目标 provider（目前只有 `'buddy'`）。 */
+  provider: string
+}
+
+/** 总览里的单个任务行。 */
+export interface RpcBuddyGrowthOverviewTask {
+  /** 任务码（如 `chat_5`）。 */
+  taskCode: string
+  /** 上游标题（缺省回落任务码）。 */
+  title: string
+  /** 奖励摘要（`+100 积分 +5 能量`；无奖励为空串）。 */
+  reward: string
+  /** 进度摘要（`3/5`；服务端未下发进度时为空串）。 */
+  progress: string
+  /** 上游状态原文（`not_accepted` / `in_progress` / `completed` / `claimed` …）。 */
+  status: string
+  /**
+   * 本仓库**能不能纯 API 推进**：
+   * - `api`：有完成动作（{@link RpcBuddyGrowthTaskResult} 的白名单）；
+   * - `client`：判据只在客户端行为里记录；
+   * - `unknown`：不认识的任务码（上游新增，未接线）。
+   */
+  reach: 'api' | 'client' | 'unknown'
+  /** 已达标未领取（可自动补领）。 */
+  claimable?: boolean
+}
+
+/** 总览里的单账号一行。 */
+export interface RpcBuddyGrowthOverviewAccount {
+  accountId: string
+  nickname: string
+  /** 本轮是否至少有一项读到数据（全失败时 `false`，见 `error`）。 */
+  ok: boolean
+  error?: string
+  /** 连登状态。 */
+  streak?: {
+    days: number
+    monthTotalDays: number
+    nextTierRemaining: number
+    makeupCards: number
+    makeupCardsMax: number
+    tiers: Array<{ tier: string; status: string; credit: number; chances: number }>
+  }
+  /** 抽奖状态。 */
+  lottery?: { chances: number; enabled: boolean }
+  /** 旅行状态。 */
+  travel?: { state: string; dailyLimitReached: boolean; rewardCredit: number }
+  /** 是否已有 Buddy（`false` = 还能领 +300）。 */
+  hasBuddy?: boolean
+  /** 任务清单（默认口径 + 小程序口径合并）。 */
+  tasks?: RpcBuddyGrowthOverviewTask[]
+  /** 上次「一键领积分」中该账号的扩展收益结果（持久化，见 `growth-run-log.ts`）。 */
+  lastRun?: {
+    /** 时间戳（毫秒）。 */
+    at: number
+    /** 一句话摘要。 */
+    summary: string
+    extras?: RpcBuddyGrowthExtras
+  }
+}
+
+/** RPC: 成长中心只读总览响应。 */
+export interface RpcBuddyGrowthOverviewResponse {
+  accounts: RpcBuddyGrowthOverviewAccount[]
 }
 /** RPC: 成长中心任务一键全自动化响应 */
 export interface RpcBuddyGrowthTasksResponse {

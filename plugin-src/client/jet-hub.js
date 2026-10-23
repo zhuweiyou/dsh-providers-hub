@@ -174,6 +174,20 @@ import {
   compensationHeadline,
   compensationHint,
 } from './compensation-panel-logic.js';
+import {
+  accountSummary,
+  extrasFailures,
+  extrasLines,
+  growthHeadline,
+  growthHint,
+  growthTone,
+  lastRunText,
+  shouldRenderGrowthCard,
+  summarizeTasks,
+  taskReachText,
+  taskStatusText,
+  tierText,
+} from './growth-center-logic.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -2819,6 +2833,21 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const compensationClaimRef = React.useRef(false);
   /**
+   * 成长任务中心（CodeBuddy 成长计划）的只读总览。
+   *
+   * 形状 `{ loading, accounts: [...], error }`；`null` = 尚未读取。
+   *
+   * ⚠️ 与补偿卡的**关键区别**：那里是「有数据才渲染」，这里是**常驻卡片** ——
+   * 用户的原始诉求就是「点了做任务没反应、没地方看」，所以即便一次都没跑过、
+   * 或上游读取失败，也要把入口与解释摆在面板上（见 `shouldRenderGrowthCard`）。
+   *
+   * 数据来自宿主 RPC `buddy.growthOverview`（纯只读：任务清单 + 连登/抽奖/旅行
+   * 状态 + **上次执行结果**（落盘，刷新不丢））。
+   */
+  const [growthCenter, setGrowthCenter] = React.useState(null);
+  /** 展开任务明细的账号 id 集合（默认收起：一个号 20+ 行会把面板撑爆）。 */
+  const [growthExpanded, setGrowthExpanded] = React.useState({});
+  /**
    * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
    *
    * ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同：
@@ -3221,10 +3250,38 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 读取**成长任务中心**总览（纯只读，见宿主 `buddy.growthOverview`）。
+   *
+   * ⚠️ 失败**只让卡片染黄**，不掀掉面板：它是附加信息（与 `loadCompensation`
+   *    同款纪律）。用户的原始诉求是「没地方看」，读取失败时也要把失败原因显示
+   *    在卡片里，而不是静默留空。
+   * ⚠️ 非 buddy 直接返回，连 RPC 都不发。
+   */
+  const loadGrowthCenter = React.useCallback(async () => {
+    if (!shouldRenderGrowthCard(provider)) return;
+    setGrowthCenter((prev) => ({ ...(prev || {}), loading: true, error: null }));
+    try {
+      const res = await rpcCall('buddy.growthOverview', { provider });
+      if (!mounted.current) return;
+      const accounts = Array.isArray(res?.accounts) ? res.accounts : [];
+      setGrowthCenter({ loading: false, accounts, error: null });
+    } catch (caught) {
+      console.error('[jet-hub] growth overview failed:', caught);
+      if (!mounted.current) return;
+      setGrowthCenter({
+        loading: false,
+        accounts: [],
+        error: (caught && caught.message) || '成长任务中心读取失败',
+      });
+    }
+  }, [provider, rpcCall]);
+
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
     void loadCompensation();
+    void loadGrowthCenter();
     // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
     // 门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
@@ -3484,6 +3541,8 @@ function ProviderPanel({ provider, rpcCall }) {
       // - 仍**逐项列出**有产出或有失败的账号：那是「哪一项为什么没涨」的唯一线索。
       let growthFailed = 0;
       let growthTimedOut = false;
+      /** 扩展收益（兑换/抽奖/旅行…）里的失败项数 —— 与「任务失败」分开计数。 */
+      let extrasFailed = 0;
       if (Array.isArray(growth) && growth.length > 0) {
         let completed = 0;
         let clientOnly = 0;
@@ -3497,6 +3556,18 @@ function ProviderPanel({ provider, rpcCall }) {
           claimedCount += account.claimedCount || 0;
           claimedCredit += account.claimedCredit || 0;
           if (account.timedOut) growthTimedOut = true;
+          /**
+           * 成长中心**扩展收益**（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。
+           *
+           * ⚠️ 必须在下面两处 `continue` **之前**处理：那些分支（凭据失效、本轮
+           * 零产出）恰恰最需要看到「扩展收益到底给了什么」—— 例如任务全做完的号
+           * 零产出，但当天可能刚兑换了 28d 档位并抽了 3 次奖。
+           */
+          const extraLines = extrasLines(account.extras);
+          const extraBad = extrasFailures(account.extras);
+          extrasFailed += extraBad.length;
+          for (const line of extraLines) details.push(`　· ${who}：${line}`);
+          for (const line of extraBad) details.push(`　· ${who}：扩展收益失败 — ${line}`);
           if (account.error) {
             details.push(`${who}：${account.error}`);
             continue;
@@ -3531,9 +3602,10 @@ function ProviderPanel({ provider, rpcCall }) {
         if (growthFailed > 0) parts.push(`成长失败 ${growthFailed} 项`);
         if (claimedCount > 0) parts.push(`自动领取 ${claimedCount} 项（+${claimedCredit} 积分）`);
         if (growthTimedOut) parts.push('本轮时间预算用尽，剩余项未执行，再点一次即可继续');
+        if (extrasFailed > 0) parts.push(`扩展收益失败 ${extrasFailed} 项`);
       }
       setClaimNotice({
-        tone: summary.failed > 0 || growthFailed > 0 ? 'warn' : 'ok',
+        tone: summary.failed > 0 || growthFailed > 0 || extrasFailed > 0 ? 'warn' : 'ok',
         text: parts.length > 0 ? parts.join('，') : '没有可领取的账号',
         details,
       });
@@ -3543,6 +3615,10 @@ function ProviderPanel({ provider, rpcCall }) {
       //   缓存（120s TTL），不绕过的话这里会把**领取前**的读数重新显示出来 ——
       //   正是本行注释想避免的现象，只是换了个成因（审计实测确认）。
       await loadCredits(true);
+      // 「有地方看」的承重腿：领取结束后立刻重读总览（任务进度、连登/抽奖/旅行
+      // 状态、以及刚落盘的「上次执行结果」都会变）。不能只靠 toast —— 它是
+      // 一次性提示，用户正是抱怨「看完就没了」。
+      await loadGrowthCenter();
     } catch (caught) {
       console.error('[jet-hub] claim credits failed:', caught);
       if (!mounted.current) return;
@@ -4143,6 +4219,104 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
+   * 成长任务中心卡片（**常驻**，仅 buddy）。
+   *
+   * ## 这张卡回答什么
+   *
+   * 用户的原始诉求：「点了做任务 本仓好像没反应，是默默做的，没地方查询和展示对吗，
+   * 我希望能有地方看到」。所以这张卡必须**同时**给出三件事：
+   *
+   * 1. **上次执行结果**（`lastRun`，宿主落盘在 `growth-logs/growth-runs.json`，
+   *    刷新/重启都不丢）—— 回答「刚才那一轮有没有生效」；
+   * 2. **现在的状态**（连登天数 / 补签卡 / 抽奖次数 / 旅行状态 / 是否已领养 /
+   *    任务已领比例）—— 回答「还差什么」；
+   * 3. **可展开的任务清单**（默认收起，一个号 20+ 行会撑爆面板）—— 回答
+   *    「还有哪些任务、哪些我能自动做」。
+   *
+   * ## 纪律
+   *
+   * ⚠️ 文案一律走纯函数（`growth-center-logic.js`），不在 JSX 里写三元 ——
+   *    组件不渲染 ⇒ 内联文案零覆盖（`compensation-panel-logic.js` 记过这个 P0）。
+   * ⚠️ 只对 buddy 渲染（AGENTS.md：通用面板里的按钮必须按 provider 分支）。
+   *    workbuddy 国际版**没有成长中心**（后端无任务列表），调了只会 404。
+   */
+  const growthCard = shouldRenderGrowthCard(provider)
+    ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': growthTone(growthCenter),
+        'data-testid': 'growth-center-card',
+      },
+      React.createElement('div', null, growthHeadline(growthCenter)),
+      React.createElement('div', { className: 'dim-jh-hint' }, growthHint(growthCenter)),
+      React.createElement('div', { className: 'dim-jh-headerActions' },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          type: 'button',
+          disabled: growthCenter?.loading === true,
+          title: '只读刷新：任务清单 + 连登/抽奖/旅行状态 + 上次执行结果。不会改动账号。',
+          onClick: () => void loadGrowthCenter(),
+        }, growthCenter?.loading === true ? '读取中…' : '刷新任务'),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          type: 'button',
+          disabled: claiming === true || !supportsCredits,
+          title: '跑一轮成长任务 + 扩展收益（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。'
+            + '单账号可能数分钟；结果会写回本卡片的「上次执行」。',
+          onClick: () => void claimCredits(),
+        }, claiming === true ? '执行中…' : '一键领取 + 成长任务'),
+      ),
+      // 逐账号明细
+      ...(Array.isArray(growthCenter?.accounts) ? growthCenter.accounts : []).map((account) => {
+        const id = account?.accountId || '';
+        const summary = accountSummary(account);
+        const lastRun = lastRunText(account?.lastRun);
+        const tasks = Array.isArray(account?.tasks) ? account.tasks : [];
+        const counts = summarizeTasks(tasks);
+        const expanded = growthExpanded[id] === true;
+        return React.createElement('div', {
+          key: id,
+          className: 'dim-jh-hint',
+          style: { marginTop: '6px' },
+        },
+        React.createElement('div', { style: { fontWeight: 600 } },
+          `${account?.nickname || id}${summary.length > 0 ? `：${summary}` : ''}`),
+        account?.error
+          ? React.createElement('div', null, `读取失败：${account.error}`)
+          : null,
+        lastRun.length > 0 ? React.createElement('div', null, `上次执行 ${lastRun}`) : null,
+        // 连登档位（一行，逗号分隔）
+        Array.isArray(account?.streak?.tiers) && account.streak.tiers.length > 0
+          ? React.createElement('div', null,
+              `连登档位：${account.streak.tiers.map(tierText).filter((text) => text.length > 0).join('，')}`)
+          : null,
+        tasks.length > 0
+          ? React.createElement('div', null,
+              React.createElement('button', {
+                className: 'dim-jh-btn',
+                type: 'button',
+                onClick: () => setGrowthExpanded((prev) => ({ ...prev, [id]: !expanded })),
+              }, `${expanded ? '收起' : '展开'}任务（${counts.total} 项：可自动 ${counts.api}`
+                + `${counts.client > 0 ? ` · 需客户端 ${counts.client}` : ''}`
+                + `${counts.claimable > 0 ? ` · 待领取 ${counts.claimable}` : ''}`
+                + ` · 已领 ${counts.claimed}）`))
+          : null,
+        expanded
+          ? React.createElement('div', { style: { marginTop: '4px' } },
+              ...tasks.map((task) => React.createElement('div', {
+                key: `${id}:${task?.taskCode || ''}`,
+                style: { paddingLeft: '8px' },
+              }, `${task?.title || task?.taskCode || '未知任务'}`
+                + `${task?.reward ? ` · ${task.reward}` : ''}`
+                + `${task?.progress ? ` · ${task.progress}` : ''}`
+                + ` · ${taskStatusText(task?.status)}`
+                + ` · ${taskReachText(task?.reach)}`)))
+          : null,
+        );
+      }),
+    )
+    : null;
+
+  /**
    * CodeBuddy 限时补偿积分卡片（仅 buddy 且已查询到状态时渲染）。
    *
    * ⚠️ **抽成变量而不是内联在 section(...) 的参数表里**：内联时它嵌在三元中，
@@ -4716,6 +4890,9 @@ function ProviderPanel({ provider, rpcCall }) {
             : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
       : null,
     compensationCard,
+    // 成长任务中心**放在补偿卡之后、账号列表之前**：它是「点了做任务有没有生效」
+    // 的唯一查看入口（用户诉求），而补偿卡是一次性活动卡，读完即可收起。
+    growthCard,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'

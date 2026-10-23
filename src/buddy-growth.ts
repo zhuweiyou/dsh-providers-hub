@@ -353,12 +353,12 @@ export interface EventSequenceOptions {
 }
 
 /** 一次成长端点调用的原始结果。 */
-type GrowthCallResult =
+export type GrowthCallResult =
   | { ok: true; status: number; body: GrowthEnvelope }
   | { ok: false; nonJson?: boolean; status?: number; message: string }
 
 /** 写端点响应的三分类。 */
-type GrowthWriteResult =
+export type GrowthWriteResult =
   | { state: 'success'; data: Record<string, unknown> }
   | { state: 'no-object'; message: string }
   | { state: 'failed'; code?: number; message: string }
@@ -463,7 +463,7 @@ function growthHeadersWithConversation(
 }
 
 /** 从 JSON 安全读取字符串。 */
-function readString(source: unknown, key: string): string {
+export function readString(source: unknown, key: string): string {
   if (typeof source !== 'object' || source === null) {
     return ''
   }
@@ -472,7 +472,7 @@ function readString(source: unknown, key: string): string {
 }
 
 /** 从 JSON 安全读取数字（非有限或非数字归 0）。 */
-function readNumber(source: unknown, key: string): number {
+export function readNumber(source: unknown, key: string): number {
   if (typeof source !== 'object' || source === null) {
     return 0
   }
@@ -481,7 +481,7 @@ function readNumber(source: unknown, key: string): number {
 }
 
 /** 把端点基址尾斜杠去掉，避免拼出 `//`。 */
-function baseOf(product: BuddyProduct): string {
+export function baseOf(product: BuddyProduct): string {
   return String(product.endpoint).replace(/\/+$/, '')
 }
 
@@ -494,7 +494,7 @@ function baseOf(product: BuddyProduct): string {
  * 像服务端问题，真因（本插件缺配置）却毫无线索。这类「不崩但静默错」比崩溃更难查。
  * （感谢 contributor 在 !62 复审中指出，原文见该 PR 讨论。）
  */
-function claimBaseOf(product: BuddyProduct): string {
+export function claimBaseOf(product: BuddyProduct): string {
   const raw = typeof product.claimBase === 'string' ? product.claimBase.trim() : ''
   return raw.replace(/\/+$/, '')
 }
@@ -509,7 +509,7 @@ function claimBaseOf(product: BuddyProduct): string {
  * 回退顺序：`webBase` → `claimBase` → `''`（两站当前同主机，但取不到时宁可返回空
  * 让调用方报可读错误，也不要拼出 `undefined/...` 这种能发出去却指向本地缺配置的 URL）。
  */
-function webBaseOf(product: BuddyProduct): string {
+export function webBaseOf(product: BuddyProduct): string {
   const explicit = typeof product.webBase === 'string' ? product.webBase.trim() : ''
   if (explicit.length > 0) {
     return explicit.replace(/\/+$/, '')
@@ -590,7 +590,7 @@ async function growthJson(
 }
 
 /** 成长读端点（GET）请求。任务列表 / 旅行状态等。 */
-function getGrowthJson(
+export function getGrowthJson(
   path: string,
   credential: BuddyCredential,
   product: BuddyProduct,
@@ -600,7 +600,7 @@ function getGrowthJson(
 }
 
 /** 成长写端点（POST）请求。接取 / 领奖 / 盲盒 / 抽奖 / 首Buddy。 */
-function postGrowthJson(
+export function postGrowthJson(
   path: string,
   credential: BuddyCredential,
   product: BuddyProduct,
@@ -655,7 +655,7 @@ function isNoObjectMessage(message: string): boolean {
  *   —— 这是**正常的幂等终态**，不是失败。
  * - `failed`：其余（含 code 400 但 msg 是 `task not completed` 这类真失败）。
  */
-function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
+export function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
   if (!result.ok) {
     return { state: 'failed', message: result.message }
   }
@@ -1784,6 +1784,40 @@ async function reportTaskEvents(
     }
   }
   return { ok: true, reported, message: `已上报 ${reported} 条事件` }
+}
+
+/**
+ * 上报**一条**对话活跃事件（`chat_request_send`）到桌面域 `/v2/report`。
+ *
+ * ## 为什么需要它（而不是复用 `reportTaskEvents`）
+ *
+ * 领养首只 Buddy 有一个硬前置：**当日必须先有活跃上报**，否则
+ * `/activity/growth/buddy/first` 恒回 HTTP 400
+ * `first_buddy task not completed yet`（参考实现 `internal/scheduler/travel.go`
+ * 的 `travelAdopt` 把「先 report 再 first」写成了显式链路，并实测 1.05s 间隔）。
+ *
+ * `reportTaskEvents` 是「按任务码上报一整串判据事件」，会引入该任务特有的字段；
+ * 这里要的是**最小、通用的一条 `chat_request_send`**，与 `black_cat` / `chat_5`
+ * 的补量上报同形，故单独抽一个入口，供 `buddy-growth-center.ts` 的领养流程注入。
+ *
+ * ⚠️ 服务端**不校验** conversationId 的真实性（参考实现实测），故这里直接生成。
+ */
+export async function reportGrowthActivity(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<{ ok: boolean; message: string }> {
+  const conversationId = newConversationId()
+  const event = chatRequestSendEvent(DEFAULT_CHAT_MODEL, DEFAULT_CHAT_MODEL, conversationId)
+  const result = await reportDesktopEvents(
+    credential,
+    product,
+    fetcher,
+    [event],
+    conversationId,
+    conversationId,
+  )
+  return { ok: result.ok, message: result.ok ? '已上报一条活跃记录' : result.message }
 }
 
 /** 拉取专家市场真实专家列表（`POST /portal/operation-platform/market/expert/list`）。

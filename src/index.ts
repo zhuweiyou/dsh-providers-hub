@@ -59,6 +59,7 @@ import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
+import { configureGrowthRunLog } from './growth-run-log.js'
 import type { CodeArtsCredential } from './types.js'
 import type { BuddyCredential } from './buddy.js'
 import type { ChannelCredential } from './jwt-utils.js'
@@ -1067,6 +1068,12 @@ export function apply(ctx: Context): void {
   // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
   // `registerAdapterIdempotent` 注册时就会包装上剔除逻辑（见该函数注释）。
   configureDeadModelStore(ctx)
+
+  // 「成长中心上次执行结果」持久化（2026-10-23）：用户报障「点了做任务好像没反应、
+  // 没地方看」—— 结果本来就存在，只是一次性 toast。本调用把模块级单例的落盘后端
+  // 挂上（`growth-run-log.ts` 的 `recordGrowthRun` 由 `provider-credits.ts` 的
+  // `afterClaim` 调用，那里没有 ctx 可拿）。**必须在任何领取路径之前**。
+  configureGrowthRunLog(ctx)
 
   // ===== Token 账本持久化（第 2 期 · 日聚合落盘）=====
   //

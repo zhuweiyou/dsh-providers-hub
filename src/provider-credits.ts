@@ -51,6 +51,13 @@
 
 import { CLINE } from './cline-product.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
+import { reportGrowthActivity } from './buddy-growth.js'
+import {
+  runGrowthCenterDaily,
+  summarizeGrowthExtras,
+  toRpcGrowthExtras,
+} from './buddy-growth-center.js'
+import { recordGrowthRun } from './growth-run-log.js'
 import type { BuddyCredential } from './buddy.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { GEMINI } from './gemini.js'
@@ -731,10 +738,51 @@ export function createProviderCredits(
        * ⚠️ `workbuddy`（国际版）**刻意不提供**：contributor 在 !62 复审中实测确认
        * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
        */
-      afterClaim: (credential, entry, run) =>
-        collectBuddyGrowth(
-          credential as BuddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
-        ),
+      afterClaim: async (credential, entry, run) => {
+        const buddyCredential = credential as BuddyCredential
+        const report = await collectBuddyGrowth(
+          buddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
+        )
+        /**
+         * ⚠️ 两个**不跑扩展收益**的情形（顺序即判据）：
+         *
+         * 1. `timedOut` —— 本轮时间预算已用尽。扩展收益一人十几发请求，再跑会把
+         *    宿主 RPC 拖超时，把「部分成功」变成「整轮失败」。
+         * 2. 凭据已失效 —— 每一项都会 401，只会往结果里灌噪声，处置只有「重新登录」。
+         */
+        const expired = report.error !== undefined && /凭据已失效/.test(report.error)
+        if (report.timedOut || expired) return report
+        // 扩展收益（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）——**只读+幂等写**，
+        // 故可以放心挂在用户的「一键领取」后面；见 src/buddy-growth-center.ts 模块头。
+        let outcome: Awaited<ReturnType<typeof runGrowthCenterDaily>>
+        try {
+          outcome = await runGrowthCenterDaily(buddyCredential, CODEBUDDY, {
+            // 领养前置的活跃上报：复用成长侧既有的 `/v2/report` 腿，不新造第三条。
+            reportActivity: () => reportGrowthActivity(buddyCredential, CODEBUDDY),
+          })
+        } catch (error) {
+          // 兜底：扩展收益**任何**异常都不得把已经到手的任务战果变成失败。
+          return {
+            ...report,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        const extras = toRpcGrowthExtras(outcome)
+        // 落盘「上次执行结果」供面板回看（`growth-run-log.ts`；**永不抛错**）。
+        recordGrowthRun(entry.id, {
+          at: Date.now(),
+          summary: [
+            `完成 ${report.completed} 项，领取 ${report.claimedCount} 项（+${report.claimedCredit} 积分）`,
+            summarizeGrowthExtras(extras),
+          ].join('；'),
+          completed: report.completed,
+          failed: report.failed,
+          claimedCount: report.claimedCount,
+          claimedCredit: report.claimedCredit,
+          extras,
+        })
+        return { ...report, extras }
+      },
     },
 
     workbuddy: {

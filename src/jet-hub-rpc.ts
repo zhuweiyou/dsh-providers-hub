@@ -22,6 +22,11 @@ import type {
   Context } from '@deepseek-ai/cordis'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
+import {
+  fetchGrowthCenterSnapshot,
+  listGrowthTasks,
+} from './buddy-growth-center.js'
+import { growthRunOf } from './growth-run-log.js'
 import type { BuddyCredential } from './buddy.js'
 import { CODEBUDDY, WORKBUDDY, productById } from './product.js'
 import { claimCompensation,
@@ -55,6 +60,9 @@ import type { CodeArtsCredential,
   RpcBuddyCompensationStatusResponse,
   RpcBuddyClaimCompensationRequest,
   RpcBuddyClaimCompensationResponse,
+  RpcBuddyGrowthOverviewAccount,
+  RpcBuddyGrowthOverviewRequest,
+  RpcBuddyGrowthOverviewResponse,
 } from './types.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
@@ -6540,6 +6548,117 @@ function registerJetHubEndpoints(
         //    会骗人的那一层，按既有入口清它足够。
         modelAdapters?.['aggregate']?.clearExpiryCache?.()
         return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
+      }
+
+      /**
+       * 成长中心**只读总览**（2026-10-23）：面板「有地方看」的数据源。
+       *
+       * ## 为什么要有这条 RPC（用户报障原文）
+       *
+       * > 「点了做任务 本仓好像没反应，是默默做的，没地方查询和展示对吗」
+       *
+       * 一键领取的结果原本只出现在**一次性 toast** 里，刷新即消失；任务清单本身
+       * 更是从来没有读出来展示过 —— 用户只能看着余额数字猜「刚才那一轮到底做了
+       * 什么」。本方法把「任务清单 + 连登/抽奖/旅行状态 + 上次执行结果」一次读全。
+       *
+       * ## 纪律
+       *
+       * - **纯只读**：只发 GET（`listGrowthTasks` / `fetchGrowthCenterSnapshot`），
+       *   不碰任何写端点，故面板可以随意刷新。
+       * - **逐账号容错**：单个账号凭据坏 / 上游 401 只让那一行报错，不整体失败
+       *   （与 `buddy.compensationStatus` 的 `scanCompensation` 同款纪律）。
+       * - **串行**：账号间不并发 —— 每个账号要打 6 个上游请求，并发会让面板刷新
+       *   撞上渠道频控（buddy 系实测有按账号的限流）。
+       */
+      case 'buddy.growthOverview': {
+        const req = payload as RpcBuddyGrowthOverviewRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const rows: RpcBuddyGrowthOverviewAccount[] = []
+        for (const account of accounts) {
+          const base = { accountId: account.id, nickname: account.nickname }
+          // 上次执行结果（持久化）与本次读数**并列**给出：前者回答「上一轮做了什么」，
+          // 后者回答「现在还差什么」—— 两者缺一，用户就得靠记忆对比。
+          const last = growthRunOf(account.id)
+          const lastRun = last === undefined
+            ? {}
+            : {
+                lastRun: {
+                  at: last.at,
+                  summary: last.summary,
+                  ...last.extras === undefined ? {} : { extras: last.extras },
+                },
+              }
+          try {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (resolved === undefined) {
+              rows.push({ ...base, ...lastRun, ok: false, error: '凭据不可用，请先重新登录该账号' })
+              continue
+            }
+            let credential: BuddyCredential
+            try {
+              credential = JSON.parse(resolved.value) as BuddyCredential
+            } catch {
+              rows.push({ ...base, ...lastRun, ok: false, error: '凭据解析失败，请重新登录该账号' })
+              continue
+            }
+            const snapshot = await fetchGrowthCenterSnapshot(credential, CODEBUDDY)
+            const tasks = await listGrowthTasks(credential, CODEBUDDY)
+            const ok = snapshot.ok || tasks.ok
+            const errors: string[] = []
+            if (!snapshot.ok && snapshot.message !== undefined) errors.push(snapshot.message)
+            if (!tasks.ok && tasks.message !== undefined) errors.push(tasks.message)
+            rows.push({
+              ...base,
+              ...lastRun,
+              ok,
+              ...errors.length > 0 ? { error: errors.join('；') } : {},
+              ...snapshot.streak === undefined || !snapshot.streak.ok
+                ? {}
+                : {
+                    streak: {
+                      days: snapshot.streak.days,
+                      monthTotalDays: snapshot.streak.monthTotalDays,
+                      nextTierRemaining: snapshot.streak.nextTierRemaining,
+                      makeupCards: snapshot.streak.makeupCards,
+                      makeupCardsMax: snapshot.streak.makeupCardsMax,
+                      tiers: snapshot.streak.tiers.map((tier) => ({
+                        tier: tier.tier,
+                        status: tier.status,
+                        credit: tier.credit,
+                        chances: tier.chances,
+                      })),
+                    },
+                  },
+              ...snapshot.lottery === undefined || !snapshot.lottery.ok
+                ? {}
+                : { lottery: { chances: snapshot.lottery.chances, enabled: snapshot.lottery.enabled } },
+              ...snapshot.travel === undefined || !snapshot.travel.ok
+                ? {}
+                : {
+                    travel: {
+                      state: snapshot.travel.state,
+                      dailyLimitReached: snapshot.travel.dailyLimitReached,
+                      rewardCredit: snapshot.travel.rewardCredit,
+                    },
+                  },
+              ...snapshot.buddy === undefined || !snapshot.buddy.ok
+                ? {}
+                : { hasBuddy: snapshot.buddy.hasBuddy },
+              ...tasks.ok ? { tasks: tasks.tasks } : {},
+            })
+          } catch (error) {
+            rows.push({
+              ...base,
+              ...lastRun,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
+        return { ok: true, value: { accounts: rows } satisfies RpcBuddyGrowthOverviewResponse }
       }
 
       case 'model.list': {
