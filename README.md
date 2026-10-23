@@ -34,7 +34,7 @@ dsh plugin --profile web add dsh-providers-hub
 
 ## 支持的渠道
 
-21 个渠道，外加 1 个 `aggregate` 聚合路由：
+22 个渠道，外加 1 个 `aggregate` 聚合路由：
 
 | 服务 | 渠道 id |
 |---|---|
@@ -59,6 +59,7 @@ dsh plugin --profile web add dsh-providers-hub
 | OpenCode | `opencode` |
 | Gemini Code Assist | `gemini` |
 | 魔搭 ModelScope | `modelscope` |
+| Codely（Unity 团结引擎） | `codely` |
 
 ## 首次使用
 
