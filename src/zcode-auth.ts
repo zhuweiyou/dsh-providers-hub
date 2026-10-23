@@ -80,8 +80,11 @@ import {
   fetchZcodeBalance,
   fetchZcodeCaptchaConfig,
   fetchZcodeClaimablePlans,
+  fetchZcodeMarketingPlans,
   fetchZcodeModels,
+  mergeZcodeClaimablePlans,
   reportZcodeActivation,
+  reportZcodeMarketingAction,
   type ZcodeBalanceResult,
   type ZcodeClaimOutcome,
 } from './zcode-upstream.js'
@@ -1231,6 +1234,31 @@ export class ZcodeAuth extends Service {
   // ===== 签到（与 CodeArts / Buddy 等共用 CheckinStatus / ClaimOutcome 形状）=====
 
   /**
+   * 取「当前可领的全部 plan」—— **两个来源合并**（2026-10-23）。
+   *
+   * ## 为什么要两个来源（用户报障：1024 活动领不到）
+   *
+   * | 来源 | 端点 | 实测（本机 4 账号） |
+   * |---|---|---|
+   * | 每日赠送 | `GET /zcode-plan/billing/preview` | `plans` 里有 `…start-plan-trust-…` |
+   * | **营销投放** | `GET /marketing/touch` | **1024 活动只在这里**（preview 恒为空） |
+   *
+   * ⇒ 只查 preview 时，1024 那 5 亿 token 与「今天没有活动」在 wire 上**同形**
+   * （都是 `plans: []`），签到永远不会去领它。
+   *
+   * ⚠ **顺序与失败隔离**：preview 先（主路径），marketing 后（补充）；
+   *   marketing 失败一律降级为空数组（`fetchZcodeMarketingPlans` 自己兜住），
+   *   **绝不影响** preview 那条既有路径。
+   * ⚠ 串行而非并发：与本文件既有的「一步步发」风格一致（zcode 有反风控纪律，
+   *   见 `model-gate.ts`），且这里只多一跳只读请求。
+   */
+  private async fetchAllClaimablePlans(credential: ZcodeCredential): Promise<ZcodeClaimablePlan[]> {
+    const preview = await fetchZcodeClaimablePlans(credential, this.fetchImpl)
+    const marketing = await fetchZcodeMarketingPlans(credential, this.fetchImpl)
+    return mergeZcodeClaimablePlans(preview, marketing)
+  }
+
+  /**
    * 查签到状态。
    *
    * ## ⚠ 判据是「有没有可领的 plan」，**不是**「列表是否为空」
@@ -1249,7 +1277,12 @@ export class ZcodeAuth extends Service {
     }
     // 补活跃信号 —— 不补则 preview 恒为空。
     await reportZcodeActivation(credential, this.fetchImpl)
-    const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl)
+    /**
+     * ⚠ 这里也必须是**合并后的全量**（不只是 preview）：否则面板会显示
+     * 「今日已领取」而 1024 活动其实还没领（两者都表现为 preview 为空）——
+     * 用户被状态误导，且「一键领取」与状态灯自相矛盾。
+     */
+    const plans = await this.fetchAllClaimablePlans(credential)
     /**
      * ⚠ `active` 恒为 `true`（拿到凭据即 true）—— 与 Qoder 的同款约定：
      * 若按「列表非空」判 `active:false`，`collectClaimResults` 会先命中
@@ -1377,7 +1410,12 @@ export class ZcodeAuth extends Service {
       }
 
       await reportZcodeActivation(credential, this.fetchImpl)
-      const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl)
+      /**
+       * ★ **两个来源合并**（见 {@link fetchAllClaimablePlans}）：1024 这类
+       * **营销投放**的 plan 不在 `preview` 里，只查 preview 会永远看不到它
+       * （用户报障：官方客户端有横幅、插件签到却领不到）。
+       */
+      const plans = await this.fetchAllClaimablePlans(credential)
       /**
        * ⚠ 「没有可领 plan」**不等于**「今天已领」——也可能是活动未投放。
        * 但两种情况下用户的动作都是「明天再来」，故归为 `already-claimed`
@@ -1608,6 +1646,40 @@ export class ZcodeAuth extends Service {
       const mapped = toClaimOutcome(outcome, plan.planId, {
         plan, accountId, sentAt: diagnosticSentAt, status: outcome.httpStatus, internalRetried,
       })
+      /**
+       * ★ **营销活动的回执**（`confirm`）—— 只在**领取成功 / 已领取**后发。
+       *
+       * ## 为什么必须发（不是可选的记账）
+       *
+       * 官方 renderer 在动作成功后立刻 `p(delivery, 'confirm')`
+       * （`out/renderer/assets/styles-n-UNIiNg.js`）。不发的话**服务端会继续把
+       * 同一个 campaign 反复投放**（实测：`marketing/touch` 每次都返回同一条
+       * `deliveries`，与是否领过无关）⇒ 我们**每一轮签到**都会为一个已经领到的
+       * plan 再 mint 一次 captcha 重发一次 claim。captcha 是**设备级**配额
+       * （阿里云同设备 150 次/小时，见 `captcha-backoff.ts` 开头），
+       * 为已领的 plan 反复消耗它是净负面。
+       *
+       * ⚠ **门控严格**：只在 `outcome.ok`（`code 0` 成功 / `1003` 已领取）时发。
+       *   失败时**绝不**发（更不发 `cancel`）—— 那等于告诉服务端「别再给我看了」，
+       *   用户会**白丢一次领取机会**。`3012` 风控时 `ok` 必为 false，天然被排除。
+       * ⚠ **`await` 而不是 fire-and-forget**：它只有一跳（约数百毫秒），
+       *   而「确定性」更重要 —— 领取流程结束后宿主可能很快关掉浏览器/进程。
+       * ⚠ 它**不参与** `noteZcodeRequest*` 埋点：那套统计的是推理/领取端点的
+       *   风控画像（`zcode-diagnostics.ts`），营销端点不是风控对象。
+       * ⚠ **失败不影响领取结果**：`reportZcodeMarketingAction` 内部把异常与
+       *   非 0 业务码统一兜成 `false`，这里只记一行日志。
+       */
+      if (outcome.ok && plan.marketingCampaignId !== undefined) {
+        const reported = await reportZcodeMarketingAction(
+          credential, plan.marketingCampaignId, 'confirm', this.fetchImpl,
+        )
+        if (!reported) {
+          this.carrierLog?.(
+            `zcode: 营销活动回执（confirm）未成功，campaign=${plan.marketingCampaignId}`
+            + '（不影响本次领取结果）',
+          )
+        }
+      }
       /**
        * ★★ 命中 `3012`（风控）⇒ **终止本账号的领取，不再发后续 plan**。
        *

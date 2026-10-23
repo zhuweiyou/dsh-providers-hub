@@ -42,10 +42,18 @@ import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { CODEARTS_PROVIDER, codeartsAcceptsImage, codeartsVisionModel } from './codearts-vision.js'
 import { reportLedgerAccount } from './token-ledger.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
-export const PROVIDER = 'codearts'
+/**
+ * codearts 的 provider id。
+ *
+ * ⚠️ 字面量的**唯一定义处在 `codearts-vision.ts`**（叶子模块）—— 注册期包装
+ *（`llm-register-compat.ts` 的 analyzeImage 摘除）与工具层判据必须同源，
+ * 两条腿不一致会让「摘掉」与「执行期断言」分叉。此处只是具名转出。
+ */
+export const PROVIDER = CODEARTS_PROVIDER
 /**
  * 本家**恒声明**的两档思考开关 —— 顺序即**强度序（弱 → 强）**（Issue IKLIDV）。
  *
@@ -444,29 +452,12 @@ export interface CodeArtsAdapterOptions {
  * 这与 IDE 自己的行为一致（IDE 也是 `fetchMultimodalModelId` 选一个 VL 模型
  * 去服务 `analyzeImage` 工具，见 `docs/agent-notes/providers-codearts.md`）。
  */
-const CODEARTS_VL_MODELS: readonly string[] = ['kimi-k2.6-vl', 'Qwen3-VL-235B']
-
-/**
- * `analyzeImage` 优先用哪个 VL 模型。
- *
- * ⚠️ 取 `kimi-k2.6-vl` 的**依据是 IDE 自己的选择**（不是我们猜的）：本机内核日志
- * `builtin-model-service` 实测 11 次采样全部是
- * `[fetchMultimodalModelId] Success, selected multimodal model: kimi-k2.6-vl,
- *  candidates: kimi-k2.6-vl, Qwen3-VL-235B`
- * ⇒ IDE 在两个候选里**恒定选它**，我们跟随。
- */
-const CODEARTS_VISION_MODEL = 'kimi-k2.6-vl'
-
-/** 该模型能否原生收图（大小写不敏感 —— 上游目录里两种写法都出现过）。 */
-export function codeartsAcceptsImage(modelId: string): boolean {
-  const key = modelId.trim().toLowerCase()
-  return CODEARTS_VL_MODELS.some((id) => id.toLowerCase() === key)
-}
-
-/** `analyzeImage` 用哪个 VL 模型（当前恒定返回 {@link CODEARTS_VISION_MODEL}）。 */
-export function codeartsVisionModel(): string {
-  return CODEARTS_VISION_MODEL
-}
+// ⚠️ 「哪个模型能收图」与「analyzeImage 用哪个 VL 模型」的**唯一定义处**在
+//    `codearts-vision.ts`（无依赖叶子模块，理由见其模块头）：那里同时被**注册期包装**
+//    （`llm-register-compat.ts` 逐请求摘除 analyzeImage）与工具层使用，
+//    写在这里会让 `llm-register-compat → llm-adapter → llm-register-compat` 成环。
+//    本文件只**转出**这两个符号，既有导入路径（`from './llm-adapter.js'`）不变。
+export { codeartsAcceptsImage, codeartsVisionModel }
 
 /**
  * 把 harness 的图片块转成 CodeArts 接受的 wire 形态。

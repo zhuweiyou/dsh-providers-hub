@@ -1234,6 +1234,9 @@ export function apply(ctx: Context): void {
         model: routed?.model ?? agent?.options?.model,
       }
     },
+    // ⚠️ 传 logger：`DSH_DISABLE_ANALYZE_IMAGE` 关闸时必须**留一条日志**，
+    //    否则「工具不见了」与「注册静默失败」同形（后者是本工具栽过的坑）。
+    { info: (message: string) => ctx.logger?.info?.(message) },
   )
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
