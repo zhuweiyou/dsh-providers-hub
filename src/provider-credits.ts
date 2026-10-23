@@ -220,6 +220,45 @@ export function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
         : '',
     })
   }
+  /**
+   * ★★ 「**已领、但还没到生效时刻**」的计划 —— 单独成一个包（2026-10-23 实测）。
+   *
+   * ## 为什么必须显示（用户报障）
+   *
+   * 领完 1024 活动后签到显示「+500.00MToken 领取成功」，**但额度查询仍是 0**
+   * ⇒ 用户以为白领了（实测上游：`balances` 桶为空、`plans[]` 里 `status: active`
+   * 且 `effective_at` = 23:00 ⇒ 额度**已锁定**、只是还没建桶）。
+   *
+   * ## 为什么不并进 `remaining`
+   *
+   * `remaining` 是「**现在就能用**」的额度；并进去会让折算层
+   * （`aggregate-expiry.ts` 的 `zcodeExpiry`）判成「有额度」⇒
+   * **在生效前就把渠道派发出去**（必然失败：额度还不存在）。
+   * ⇒ 独立成包，且 `remaining/total` 都给 0（此刻确实不能用），
+   *   只用 `expiredTime` 之外的 `cycleStartTime` 携带**生效时刻**。
+   *
+   * ⚠ `active: false` —— 它**不是**当前可用额度（前端据此不计入可用合计）。
+   */
+  for (const pending of result.pendingPlans ?? []) {
+    packages.push({
+      name: pending.name ?? 'ZCode 活动额度（待生效）',
+      unit: pending.unitType ?? 'token',
+      remaining: 0,
+      total: pending.grantUnits ?? 0,
+      used: 0,
+      active: false,
+      // ⚠ **生效时刻**放在 cycleStartTime（前端「待生效/生效倒计时」读它）。
+      cycleStartTime: pending.effectiveAt !== undefined
+        ? new Date(pending.effectiveAt * 1000).toISOString()
+        : '',
+      cycleEndTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
+        : '',
+      expiredTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
+        : '',
+    })
+  }
   return {
     // 仍是**全桶汇总**，与 `packages` 逐项之和一致（`fetchZcodeBalance` 就是这么累加的）。
     total: result.remaining,
