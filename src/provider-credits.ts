@@ -740,7 +740,7 @@ export function createProviderCredits(
       afterClaim: async (credential, entry, run) => {
         const buddyCredential = credential as BuddyCredential
         const report = await collectBuddyGrowth(
-          buddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
+          buddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt, run.onStep,
         )
         /**
          * ⚠️ 两个**不跑扩展收益**的情形（顺序即判据）：
@@ -758,6 +758,8 @@ export function createProviderCredits(
           outcome = await runGrowthCenterDaily(buddyCredential, CODEBUDDY, {
             // 领养前置的活跃上报：复用成长侧既有的 `/v2/report` 腿，不新造第三条。
             reportActivity: () => reportGrowthActivity(buddyCredential, CODEBUDDY),
+            // 进度回调：面板状态行据此显示「这个号现在在做哪一步」。
+            ...run.onStep === undefined ? {} : { onStep: run.onStep },
           })
         } catch (error) {
           // 兜底：扩展收益**任何**异常都不得把已经到手的任务战果变成失败。

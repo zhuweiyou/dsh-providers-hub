@@ -116,8 +116,57 @@
 - **领养门槛错误不是失败**：HTTP 400 `first_buddy task not completed yet` = 今日活跃
   还没点亮，`isBuddyAdoptNotReady` 归 `skipped` + 「明天再试」。
 
-## 7. 验证口径
+## 7.5 按需读取 + 状态行 + 后台语义（2026-10-23 第二轮，用户报障）
 
+用户原话（两条，都是对着面板说的）：
+
+> 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发 API 请求太多了」
+> 「看不到任务执行进度，至少也要给到一个状态行，告知当前哪个号正在做什么任务，还有面板切走了，任务在后台还会做吗？还是会停止，这个要在画面说明出来」
+
+⇒ 三条改造，**判据都在「请求成本」与「事实」上**：
+
+### 7.5.1 读的粒度分三层（这是本轮的核心）
+
+| 数据 | RPC | 成本 | 何时读 |
+|---|---|---|---|
+| 实时进度 | `buddy.growthProgress` | **0 上游**（宿主内存） | 打开面板 + 每 3s 轮询 |
+| 上次执行结果 | `buddy.growthLastRuns` | **0 上游**（读 `growth-runs.json`） | 打开面板 + 领取后 |
+| 任务清单 + 连登/抽奖/旅行/猫 | `buddy.growthOverview` | **每账号约 6 个上游 GET** | **只在点「读取任务清单」时** |
+
+⚠️ 旧实现是「挂载就跑总览」⇒ 6 个账号就是 36 个上游请求，而且卡片会长时间停在
+「读取中…」（用户截图里那个外观）。守卫见 `tests/unit/growth-center-wiring.spec.ts`
+（挂载 effect 不得出现 `loadGrowthCenter(` / `buddy.growthOverview`；总览 RPC 全局只有
+**一个**调用点）。
+⚠️ 该守卫的锚点踩过一次坑：**不能锚 `mounted.current = true;`** —— 文件里别的组件
+（模型选择弹窗）也有同款语句，`indexOf` 会命中那里、切片跨到 9 万字符后（假红）。
+
+### 7.5.2 状态行（「哪个号正在做什么」）
+
+- 宿主：`src/growth-progress.ts` 单例记 `{runId, running, doneAccounts/totalAccounts,
+  current:{accountId, nickname, text}}`，由 `collectClaimResults` 在**每个账号前后**维护，
+  由 `provider-credits` 的 `afterClaim` 通过 `GrowthRunOptions.onStep` 逐动作上报
+  （`任务 chat_5：发一条对话` / `补领 xxx` / `猫猫旅行` …）。
+- 客户端：每 3s 轮询 `buddy.growthProgress`，卡片第一行显示
+  `⏳ 正在跑 <昵称> · <步骤> · 账号 2/3`；结束后显示本轮摘要。
+- ⚠️ **`running` 必须能回到 false**：`collectClaimResults` 的循环包在 `try/catch` 里，
+  异常路径也调 `finishGrowthRun` —— 否则面板会**永远显示「执行中」并禁用按钮**（比没有进度更糟）。
+
+### 7.5.3 后台语义（用户明确要求写在画面上）
+
+事实：一键领取是**一次宿主侧 RPC**，逐账号循环跑在宿主进程里（`collectClaimResults`）。
+面板切走只影响「结果怎么显示」（`mounted.current=false` 后不上屏），**请求不会被打断**；
+进度表与结果日志都在宿主侧 ⇒ 切回来仍能看到「正在执行 / 刚刚完成」。
+
+⇒ 卡片常驻一行 `backgroundHint()`：「执行在宿主进程里进行：切换渠道、关掉面板、刷新页面
+都**不会中断**；回来后再点开本面板即可看到进度与「上次执行」结果。进度每 3 秒刷新一次
+（本地内存，不请求上游）。」
+
+⚠️ 因为切走后本地 `claimInFlightRef` 会重置，**必须**再加一条宿主侧防重入：
+`credits.claimAll` 在 `runTasks === true` 且 `growthRunActive(provider)` 时直接返回
+`busy` 错误（文案指引去看进度），否则连点两次会**并发跑两轮**（同一批账号被两套事件链
+重复上报 ⇒ 上游判无效/回滚 + 限流风险翻倍）。
+
+## 7. 验证口径
 - 单测：`tests/unit/buddy-growth-center.spec.ts`（26+2）、
   `tests/unit/buddy-mp-tasks.spec.ts`（8，含 2 条 30s 超时的真实节奏用例）、
   `tests/unit/growth-center-logic.spec.ts`（17）、`tests/unit/growth-run-log.spec.ts`（7）。

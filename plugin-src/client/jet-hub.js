@@ -176,12 +176,20 @@ import {
 } from './compensation-panel-logic.js';
 import {
   accountSummary,
+  backgroundHint,
   extrasFailures,
   extrasLines,
-  growthHeadline,
-  growthHint,
+  growthCardTitle,
   growthTone,
+  lastRunDigest,
   lastRunText,
+  overviewCostHint,
+  overviewIdleHint,
+  overviewLoadedHint,
+  overviewLoadingHint,
+  overviewStaleHint,
+  progressLine,
+  runOf,
   shouldRenderGrowthCard,
   summarizeTasks,
   taskReachText,
@@ -2845,6 +2853,20 @@ function ProviderPanel({ provider, rpcCall }) {
    * 状态 + **上次执行结果**（落盘，刷新不丢））。
    */
   const [growthCenter, setGrowthCenter] = React.useState(null);
+  /**
+   * **廉价**的成长状态：实时进度（宿主内存）+ 上次执行结果（本地磁盘）。
+   *
+   * ⚠️⚠️ 与 `growthCenter`（贵的快照）分离，是 2026-10-23 用户报障的直接产物：
+   * > 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发
+   * >  API 请求太多了」
+   *
+   * 分工：
+   * - 本状态 = `buddy.growthProgress`（零上游）+ `buddy.growthLastRuns`（零上游）；
+   *   打开面板就读、并每 3s 轮询进度；
+   * - `growthCenter` = `buddy.growthOverview`（**每账号约 6 个上游请求**）⇒
+   *   **只在用户点「读取任务清单」时**才发。
+   */
+  const [growthLive, setGrowthLive] = React.useState({ runs: [], progress: null });
   /** 展开任务明细的账号 id 集合（默认收起：一个号 20+ 行会把面板撑爆）。 */
   const [growthExpanded, setGrowthExpanded] = React.useState({});
   /**
@@ -3251,11 +3273,34 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
-   * 读取**成长任务中心**总览（纯只读，见宿主 `buddy.growthOverview`）。
+   * 读取**廉价**状态：实时进度（零上游）+ 上次执行结果（零上游）。
    *
-   * ⚠️ 失败**只让卡片染黄**，不掀掉面板：它是附加信息（与 `loadCompensation`
-   *    同款纪律）。用户的原始诉求是「没地方看」，读取失败时也要把失败原因显示
-   *    在卡片里，而不是静默留空。
+   * ⚠️ 这是**打开面板就会跑**的那条腿，故它**绝不能**发上游请求：
+   * `buddy.growthProgress` 只读宿主内存，`buddy.growthLastRuns` 只读本地
+   * `growth-runs.json`。任务清单（贵）走 {@link loadGrowthCenter}，只在点按钮时跑。
+   */
+  const loadGrowthLive = React.useCallback(async () => {
+    if (!shouldRenderGrowthCard(provider)) return;
+    const [progress, runs] = await Promise.all([
+      rpcCall('buddy.growthProgress', { provider }).catch(() => null),
+      rpcCall('buddy.growthLastRuns', { provider }).catch(() => null),
+    ]);
+    if (!mounted.current) return;
+    setGrowthLive((prev) => ({
+      progress: progress && progress.run ? progress.run : null,
+      // 拉取失败时**保留**上一次的记录：本地记录不该因为一次 RPC 抖动就清空。
+      runs: runs && Array.isArray(runs.runs) ? runs.runs : prev.runs,
+    }));
+  }, [provider, rpcCall]);
+
+  /**
+   * 读取**任务清单总览**（`buddy.growthOverview`，**贵**：每账号约 6 个上游请求）。
+   *
+   * ⚠️ 2026-10-23 用户报障后改为**只由按钮触发**，不再随面板挂载自动跑：
+   * > 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发
+   * >  API 请求太多了」
+   *
+   * ⚠️ 失败**只让卡片染黄**，不掀掉面板。
    * ⚠️ 非 buddy 直接返回，连 RPC 都不发。
    */
   const loadGrowthCenter = React.useCallback(async () => {
@@ -3265,7 +3310,7 @@ function ProviderPanel({ provider, rpcCall }) {
       const res = await rpcCall('buddy.growthOverview', { provider });
       if (!mounted.current) return;
       const accounts = Array.isArray(res?.accounts) ? res.accounts : [];
-      setGrowthCenter({ loading: false, accounts, error: null });
+      setGrowthCenter({ loading: false, accounts, error: null, loadedAt: Date.now(), stale: false });
     } catch (caught) {
       console.error('[jet-hub] growth overview failed:', caught);
       if (!mounted.current) return;
@@ -3277,11 +3322,26 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   }, [provider, rpcCall]);
 
+  /**
+   * 进度轮询（每 3s）：**只打 `buddy.growthProgress`**（宿主内存，零上游）。
+   *
+   * ⚠️ 为什么即便本地 `claiming === false` 也要轮询：一轮可能由**另一个面板**
+   * （或切走前的本面板）在宿主里跑着，回来时必须以宿主为准 —— 否则会出现
+   * 「宿主在跑、按钮却是可点的」⇒ 点下去撞 `busy` 错误。
+   * ⚠️ 卸载/切 provider 必须清定时器（否则会一直打 RPC）。
+   */
+  React.useEffect(() => {
+    if (!shouldRenderGrowthCard(provider)) return undefined;
+    const timer = setInterval(() => { void loadGrowthLive(); }, 3000);
+    return () => { clearInterval(timer); };
+  }, [provider, loadGrowthLive]);
+
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
     void loadCompensation();
-    void loadGrowthCenter();
+    // ⚠️ **只读本地**（进度 + 上次执行）；任务清单改为点按钮才读（见 loadGrowthCenter）。
+    void loadGrowthLive();
     // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
     // 门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
@@ -3615,10 +3675,11 @@ function ProviderPanel({ provider, rpcCall }) {
       //   缓存（120s TTL），不绕过的话这里会把**领取前**的读数重新显示出来 ——
       //   正是本行注释想避免的现象，只是换了个成因（审计实测确认）。
       await loadCredits(true);
-      // 「有地方看」的承重腿：领取结束后立刻重读总览（任务进度、连登/抽奖/旅行
-      // 状态、以及刚落盘的「上次执行结果」都会变）。不能只靠 toast —— 它是
-      // 一次性提示，用户正是抱怨「看完就没了」。
-      await loadGrowthCenter();
+      // 「有地方看」的承重腿：领取结束后只重读**本地**那两份（进度 + 上次执行），
+      // 不重读任务清单 —— 那要每账号 6 个上游请求，用户明确要求「点了才读」。
+      // 已读过的快照据此标 `stale`，卡片会提示「这是执行前的快照」。
+      setGrowthCenter((prev) => (prev === null ? prev : { ...prev, stale: true }));
+      await loadGrowthLive();
     } catch (caught) {
       console.error('[jet-hub] claim credits failed:', caught);
       if (!mounted.current) return;
@@ -4240,36 +4301,72 @@ function ProviderPanel({ provider, rpcCall }) {
    * ⚠️ 只对 buddy 渲染（AGENTS.md：通用面板里的按钮必须按 provider 分支）。
    *    workbuddy 国际版**没有成长中心**（后端无任务列表），调了只会 404。
    */
+  /** 进度 / 上次执行（**零上游**，每 3s 由 `loadGrowthLive` 轮询）。 */
+  const growthProgress = growthLive?.progress || null;
+  const growthRuns = Array.isArray(growthLive?.runs) ? growthLive.runs : [];
+  const growthRunning = growthProgress?.running === true;
   const growthCard = shouldRenderGrowthCard(provider)
     ? React.createElement('div', {
         className: 'dim-jh-probeNotice',
-        'data-tone': growthTone(growthCenter),
+        'data-tone': growthRunning ? 'ok' : growthTone(growthCenter),
         'data-testid': 'growth-center-card',
       },
-      React.createElement('div', null, growthHeadline(growthCenter)),
-      React.createElement('div', { className: 'dim-jh-hint' }, growthHint(growthCenter)),
+      React.createElement('div', null, growthCardTitle({
+        overview: growthCenter,
+        progress: growthProgress,
+        accountCount: accounts.length,
+      })),
+      // ── 状态行（用户明确要求）：「当前哪个号正在做什么任务」 ──
+      React.createElement('div', {
+        className: 'dim-jh-hint',
+        'data-testid': 'growth-status-line',
+        style: { fontWeight: growthRunning ? 600 : 400 },
+      }, growthRunning
+        ? `⏳ ${progressLine(growthProgress)}`
+        : (progressLine(growthProgress) || lastRunDigest(growthRuns))),
+      // ── 后台语义（用户明确要求「要在画面说明出来」）──
+      React.createElement('div', { className: 'dim-jh-hint' }, backgroundHint()),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         React.createElement('button', {
           className: 'dim-jh-btn',
           type: 'button',
           disabled: growthCenter?.loading === true,
-          title: '只读刷新：任务清单 + 连登/抽奖/旅行状态 + 上次执行结果。不会改动账号。',
+          title: '只读读取：任务清单 + 连登/抽奖/旅行状态。'
+            + '⚠️ 每个账号约 6 个上游请求，故只在点它时才发（打开面板不会自动读）。',
           onClick: () => void loadGrowthCenter(),
-        }, growthCenter?.loading === true ? '读取中…' : '刷新任务'),
+        }, growthCenter?.loading === true ? '读取中…' : '读取任务清单'),
         React.createElement('button', {
           className: 'dim-jh-btn',
           type: 'button',
-          disabled: claiming === true || !supportsCredits,
+          // ⚠️ 闸门读**宿主**进度，不只读本地 `claiming`：切走再回来时本地早已
+          //   重置，而宿主那轮可能还在跑（点下去会撞 busy）。
+          disabled: claiming === true || growthRunning || !supportsCredits,
           title: '跑一轮成长任务 + 扩展收益（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。'
-            + '单账号可能数分钟；结果会写回本卡片的「上次执行」。',
+            + '单账号可能数分钟；执行在宿主进程里，切走不会中断。',
           onClick: () => void claimCredits(),
-        }, claiming === true ? '执行中…' : '一键领取 + 成长任务'),
+        }, claiming === true || growthRunning ? '执行中…' : '一键领取 + 成长任务'),
       ),
-      // 逐账号明细
+      React.createElement('div', { className: 'dim-jh-hint' },
+        growthCenter?.loading === true ? overviewLoadingHint(accounts.length) : overviewCostHint(accounts.length)),
+      // ── 任务清单（仅「读过」之后才有；未读时明确说「要手动读」而不是挂一个转圈）──
+      growthCenter === null
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewIdleHint())
+        : null,
+      growthCenter !== null && growthCenter.error
+        ? React.createElement('div', { className: 'dim-jh-hint' }, `读取失败：${growthCenter.error}`)
+        : null,
+      growthCenter !== null && !growthCenter.error
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewLoadedHint(growthCenter.loadedAt))
+        : null,
+      growthCenter?.stale === true
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewStaleHint())
+        : null,
+      // ── 逐账号明细 ──
       ...(Array.isArray(growthCenter?.accounts) ? growthCenter.accounts : []).map((account) => {
         const id = account?.accountId || '';
         const summary = accountSummary(account);
-        const lastRun = lastRunText(account?.lastRun);
+        // 上次执行优先取**本地日志**（执行后立刻就有），退到总览里那份（读过时才有）。
+        const lastRun = runOf(growthRuns, id) || lastRunText(account?.lastRun);
         const tasks = Array.isArray(account?.tasks) ? account.tasks : [];
         const counts = summarizeTasks(tasks);
         const expanded = growthExpanded[id] === true;

@@ -343,6 +343,13 @@ export interface GrowthCompletionOptions {
    * 2s 连发 4 条全灭、45s 间隔逐条上报全存活）。传 0 只允许在单测里用。
    */
   mpChatEventGapMs?: number
+  /**
+   * 进度回调（可选）：每进入一个动作前叫一次（人类可读），供面板状态行显示。
+   *
+   * ⚠️ 契约：**永不抛错、允许高频**。实现方（本文件）只把它当纯观测通道 ——
+   * 它坏了不得影响领取结果，故所有调用点都包在既有的 try 内。
+   */
+  onStep?: (step: string) => void
 }
 
 /** {@link runGrowthTaskCompletions} 的单项结果。 */
@@ -2759,6 +2766,7 @@ export async function runGrowthTaskCompletions(
    * ⚠️ **web 与 mp 两批必须分开提交**（`X-Client-Platform` 不同）：混在一批里会让
    * 上游对 mp 任务回 `task not found`（参考实现 `tasksweep.go` 把两批拆开提交）。
    */
+  if (toAccept.length > 0) options.onStep?.('接取任务')
   const toAcceptWeb = toAccept.filter((code) => !MP_TASK_CODES.has(code))
   const toAcceptMp = toAccept.filter((code) => MP_TASK_CODES.has(code))
   const emptyAccept = { ok: true, status: 200, body: { code: 0 } } satisfies GrowthCallResult
@@ -2857,6 +2865,8 @@ export async function runGrowthTaskCompletions(
       continue
     }
     try {
+      // 状态行：这一项叫什么（`label` 是给用户看的中文名，不是任务码）。
+      options.onStep?.(`任务 ${code}：${spec.label}`)
       switch (spec.kind) {
         case 'canvas':
         case 'canvasThenChat': {
@@ -3324,6 +3334,9 @@ export async function runGrowthTaskCompletions(
         failed += 1
         break
       }
+      // 状态行：扫尾阶段逐项报（`补领 <code>`），与上面的「任务 <code>：<label>」区分开
+      // —— 用户在等的时候能看出「现在是在做任务，还是在把已达标的一批领掉」。
+      options.onStep?.(`补领 ${code}`)
       const claim = await claimGrowthTaskReward(credential, product, fetcher, code)
       if (claim.ok && claim.claimed) {
         claimedCount += 1
@@ -3384,6 +3397,13 @@ export async function collectBuddyGrowth(
   entry: ProviderAccountEntry,
   budgetMs: number | undefined,
   roundDeadlineAt: number | undefined,
+  /**
+   * 进度回调（可选）：一路透传给 unGrowthTaskCompletions 的 onStep。
+   *
+   * 存在的理由：一键领取是**一次 RPC 跑几分钟**，面板只能靠宿主侧进度表
+   * （src/growth-progress.ts）来显示「这个号现在在做什么」。
+   */
+  onStep?: (step: string) => void,
 ): Promise<RpcBuddyGrowthAccountResult> {
   // 整轮预算已耗尽 ⇒ 该账号**不再发起任何成长请求**。
   //
@@ -3400,7 +3420,10 @@ export async function collectBuddyGrowth(
   }
   let report: Awaited<ReturnType<typeof runGrowthTaskCompletions>>
   try {
-    report = await runGrowthTaskCompletions(credential, product, fetch, { budgetMs })
+    report = await runGrowthTaskCompletions(credential, product, fetch, {
+      budgetMs,
+      ...onStep === undefined ? {} : { onStep },
+    })
   } catch (error) {
     return {
       accountId: entry.id, nickname: entry.nickname,

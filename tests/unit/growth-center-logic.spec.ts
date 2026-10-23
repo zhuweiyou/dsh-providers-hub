@@ -1,12 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import {
   accountSummary,
+  backgroundHint,
   extrasFailures,
   extrasLines,
+  growthCardTitle,
   growthHeadline,
   growthHint,
   growthTone,
+  lastRunDigest,
   lastRunText,
+  overviewCostHint,
+  overviewIdleHint,
+  overviewLoadedHint,
+  overviewLoadingHint,
+  overviewStaleHint,
+  progressLine,
+  runOf,
   shouldRenderGrowthCard,
   summarizeTasks,
   taskReachText,
@@ -155,5 +165,107 @@ describe('卡片文案与色调', () => {
     expect(shouldRenderGrowthCard('buddy')).toBe(true)
     expect(shouldRenderGrowthCard('workbuddy')).toBe(false)
     expect(shouldRenderGrowthCard('codearts')).toBe(false)
+  })
+})
+
+/**
+ * 2026-10-23 用户两条报障的判据：
+ *
+ * 1. > 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发
+ *    >  API 请求太多了」
+ * 2. > 「看不到任务执行进度，至少也要给到一个状态行…还有面板切走了，任务在后台还会做吗？」
+ */
+describe('按需读取的文案（成本必须写在按钮旁）', () => {
+  it('成本提示带账号数与总请求量（让用户自己决定读不读）', () => {
+    expect(overviewCostHint(6)).toBe('读取会向每个账号发约 6 个只读请求（当前 6 个账号，共约 36 个）')
+    expect(overviewCostHint(1)).toContain('共约 6 个')
+    expect(overviewCostHint(0)).toContain('还没有账号')
+    // 非法输入不得崩/不得写出 NaN
+    expect(overviewCostHint(undefined)).toContain('还没有账号')
+  })
+
+  it('「还没读」与「读了但失败」必须可辨', () => {
+    expect(overviewIdleHint()).toContain('手动读取')
+    expect(overviewIdleHint()).toContain('不会自动请求上游')
+    expect(overviewStaleHint()).toContain('执行前的快照')
+  })
+
+  it('已读取时显示快照时间', () => {
+    const text = overviewLoadedHint(Date.parse('2026-10-23T06:05:00Z'))
+    expect(text).toContain('快照')
+    expect(text).toMatch(/\d{2}:\d{2}/)
+    expect(overviewLoadedHint(0)).toContain('快照')
+  })
+
+  it('读取中要说明「要多久 / 在做什么」（否则看起来像卡死）', () => {
+    expect(overviewLoadingHint(6)).toContain('6 个账号')
+    expect(overviewLoadingHint(6)).toContain('请稍等')
+    expect(overviewLoadingHint(0)).toContain('正在读取')
+  })
+})
+
+describe('状态行（正在跑哪个号 / 在做什么）', () => {
+  it('running 时给出「正在跑 X · 步骤 · 账号 2/3」三段', () => {
+    const line = progressLine({
+      running: true,
+      doneAccounts: 1,
+      totalAccounts: 3,
+      current: { accountId: 'a2', nickname: '1776****', text: '任务 chat_5：发一条对话' },
+    })
+    expect(line).toContain('正在跑 1776')
+    expect(line).toContain('任务 chat_5')
+    expect(line).toContain('账号 2/3')
+  })
+
+  it('没有 current 时回落「准备中」，不是空白', () => {
+    expect(progressLine({ running: true, doneAccounts: 0, totalAccounts: 2 })).toContain('准备中')
+  })
+
+  it('结束后显示摘要；有 error 时显示异常', () => {
+    expect(progressLine({ running: false, summary: '本轮结束：3 个账号' })).toBe('本轮结束：3 个账号')
+    expect(progressLine({ running: false, error: 'boom' })).toBe('执行异常：boom')
+    expect(progressLine({ running: false })).toBe('')
+    expect(progressLine(null)).toBe('')
+  })
+
+  it('背景语义说明必须讲清「切走不会中断」+「进度轮询不吃上游」', () => {
+    const text = backgroundHint()
+    expect(text).toContain('不会中断')
+    expect(text).toContain('宿主进程')
+    expect(text).toContain('不请求上游')
+  })
+})
+
+describe('lastRunDigest / runOf / growthCardTitle', () => {
+  const runs = [
+    { accountId: 'a1', at: Date.parse('2026-10-23T06:00:00Z'), summary: '完成 3 项' },
+    { accountId: 'a2', at: Date.parse('2026-10-23T05:00:00Z'), summary: '完成 1 项' },
+  ]
+
+  it('digest 给出最近时间与账号数', () => {
+    expect(lastRunDigest(runs)).toContain('2 个账号有记录')
+    expect(lastRunDigest([])).toBe('本机还没有执行记录')
+    expect(lastRunDigest(undefined)).toBe('本机还没有执行记录')
+  })
+
+  it('runOf 只取该账号那条；账号不在记录里返回空串', () => {
+    expect(runOf(runs, 'a2')).toContain('完成 1 项')
+    expect(runOf(runs, 'zzz')).toBe('')
+    expect(runOf(undefined, 'a1')).toBe('')
+  })
+
+  it('标题区分「未读清单 / 执行中 / 已读」三种状态', () => {
+    // 未读清单时**不能说「无账号」**（用户会以为账号丢了）
+    expect(growthCardTitle({ accountCount: 4, overview: null, progress: null }))
+      .toBe('成长任务中心 · 4 个账号（清单未读取）')
+    expect(growthCardTitle({ accountCount: 0, overview: null })).toBe('成长任务中心 · 无账号')
+    expect(growthCardTitle({ accountCount: 4, overview: { loading: true } })).toContain('读取中')
+    expect(growthCardTitle({ accountCount: 4, progress: { running: true, totalAccounts: 4 } }))
+      .toBe('成长任务中心 · 执行中（4 个账号）')
+    expect(growthCardTitle({
+      accountCount: 2,
+      overview: { accounts: [{ ok: true }, { ok: false }] },
+      progress: { running: false },
+    })).toBe('成长任务中心 · 2 个账号（1 个读取失败）')
   })
 })

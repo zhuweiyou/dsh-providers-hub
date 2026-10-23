@@ -773,6 +773,13 @@ export interface GrowthCenterRunOptions {
    */
   reportActivity?: () => Promise<{ ok: boolean; message: string }>
   now?: () => number
+  /**
+   * 进度回调（可选）：每个阶段开始前叫一次（`礼包` / `补签` / `连登兑换` / `抽奖` /
+   * `旅行` / `领养`），供面板状态行显示「这个号现在在做哪一步」。
+   *
+   * ⚠️ 契约：**永不抛错**。各阶段函数本身就返回结果对象而不抛，故这里直接调。
+   */
+  onStep?: (step: string) => void
 }
 
 /**
@@ -796,9 +803,12 @@ export async function runGrowthCenterDaily(
   const fetcher = options.fetcher ?? fetch
   const nowMs = (options.now ?? Date.now)()
 
+  options.onStep?.('新手礼包')
   const gift = await claimGift(credential, product, fetcher)
+  options.onStep?.('补签检查')
   const makeup = await makeupYesterday(credential, product, fetcher, nowMs)
 
+  options.onStep?.('连登状态')
   const detail = await fetchStreakDetail(credential, product, fetcher)
   let streakRedeemed: string[] = []
   let streak: GrowthCenterOutcome['streak']
@@ -810,6 +820,7 @@ export async function runGrowthCenterDaily(
       message: `连登状态查询失败：${detail.message ?? '未知原因'}`,
     }
   } else {
+    options.onStep?.('连登档位兑换')
     const redeemed = await redeemUnlockedTiers(credential, product, detail, fetcher)
     streakRedeemed = redeemed.redeemed.map((tier) => tier.tier)
     const parts: string[] = [`连登 ${detail.days} 天`]
@@ -831,6 +842,7 @@ export async function runGrowthCenterDaily(
     }
   }
 
+  options.onStep?.('抽奖')
   const lotteryResult = await drawAllLottery(credential, product, {
     fetcher,
     ...options.maxLotteryDraws === undefined ? {} : { maxDraws: options.maxLotteryDraws },
@@ -843,6 +855,7 @@ export async function runGrowthCenterDaily(
     ...lotteryResult.drawn === 0 && lotteryResult.ok ? { skipped: true } : {},
   }
 
+  options.onStep?.('猫猫旅行')
   const travelResult = await advanceTravel(credential, product, fetcher)
   const travel: GrowthCenterOutcome['travel'] = {
     ok: travelResult.action === 'depart' || travelResult.action === 'claim',
@@ -861,6 +874,7 @@ export async function runGrowthCenterDaily(
     } else if (info.hasBuddy) {
       adopt = { ok: true, skipped: true, message: info.name.length > 0 ? `已有 Buddy：${info.name}` : '已有 Buddy' }
     } else {
+      options.onStep?.('领养首只 Buddy')
       adopt = await adoptBuddy(credential, product, fetcher, { reportActivity: options.reportActivity })
     }
   }

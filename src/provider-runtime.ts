@@ -683,6 +683,22 @@ export interface GrowthRunOptions {
    * 无来由的失败。
    */
   readonly roundDeadlineAt: number | undefined
+  /**
+   * 进度回调（可选）：**人类可读的一步**，如 `任务 chat_5：发一条对话`。
+   *
+   * ## 为什么放在这里（2026-10-23 用户报障）
+   *
+   * > 「看不到任务执行进度，至少也要给到一个状态行，告知当前哪个号正在做什么任务」
+   *
+   * 一键领取是**一次 RPC 跑几分钟**，此前只有「执行中…」四个字。骨架
+   * （`collectClaimResults`）负责把「哪个账号 / 第几个」写进宿主侧进度表
+   * （`src/growth-progress.ts`），本回调只负责「这个账号里现在在做什么」——
+   * 实现方在每个动作前叫一次即可。
+   *
+   * ⚠️ **契约：永不抛错、允许高频**。它是纯观测通道，实现方**不得**因为它失败
+   * 而改变领取结果。
+   */
+  readonly onStep?: (step: string) => void
 }
 
 /**

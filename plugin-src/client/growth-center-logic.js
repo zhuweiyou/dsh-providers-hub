@@ -229,3 +229,147 @@ export function growthTone(state) {
 export function shouldRenderGrowthCard(provider) {
   return provider === 'buddy'
 }
+
+/* ───────────────────────── 2026-10-23：按需读取 + 实时进度 ───────────────────────── */
+
+/**
+ * 「读取任务清单」这个动作的**成本提示**。
+ *
+ * 背景（用户报障原文）：「这个要弄个按钮点了才读取，而不是打开插件面板就读取，
+ * 这样每次都要向上游发 API 请求太多了」。总览每个账号要打 6 个上游 GET
+ * （连登 / 抽奖 / 旅行 / 猫档案 / 任务列表 ×2 口径），故必须**把成本写在按钮旁边**，
+ * 让用户自己决定 —— 而不是让他在不知情的情况下每次打开面板都打一遍。
+ */
+export function overviewCostHint(accountCount) {
+  const count = typeof accountCount === 'number' && accountCount > 0 ? accountCount : 0
+  if (count === 0) return '读取会向每个账号发约 6 个只读请求（当前还没有账号）'
+  return `读取会向每个账号发约 6 个只读请求（当前 ${count} 个账号，共约 ${count * 6} 个）`
+}
+
+/**
+ * 未读取任务清单时的占位说明（**明确区分「还没读」与「读了但失败」**）。
+ *
+ * ⚠️ 这两种状态在 UI 上必须可辨：前者是用户没点按钮（正常），后者是上游/凭据问题
+ * （需要处置）。旧实现打开面板就自动读，于是「读取中…」会长期挂在卡片上
+ * （2026-10-23 用户截图），看起来像卡死。
+ */
+export function overviewIdleHint() {
+  return '任务清单需要手动读取（点上方「读取任务清单」）—— 打开面板不会自动请求上游。'
+}
+
+/** 已读取时的快照时间提示。 */
+export function overviewLoadedHint(loadedAt) {
+  const when = formatLocalTime(loadedAt)
+  if (when.length === 0) return '任务清单为快照，执行后请重新读取'
+  return `任务清单读取于 ${when}（快照）—— 执行后请重新读取`
+}
+
+/**
+ * 读取**进行中**的提示。
+ *
+ * ⚠️ 必须给「大概要多久 / 在做什么」，否则一次 6 个账号的串行读取会让卡片长时间
+ * 停在「读取中…」，与 2026-10-23 用户截图里那个「卡住」的外观一模一样。
+ */
+export function overviewLoadingHint(accountCount) {
+  const count = typeof accountCount === 'number' && accountCount > 0 ? accountCount : 0
+  return count > 0
+    ? `正在逐个账号读取（${count} 个账号 × 约 6 个请求，串行，请稍等）`
+    : '正在读取账号状态…'
+}
+
+/** 执行过后快照变旧：明确提示「现在看到的是执行前的数据」。 */
+export function overviewStaleHint() {
+  return '这是执行前的快照；点了「读取任务清单」才刷新。'
+}
+
+/**
+ * **实时进度**的一行文案（宿主侧 `describeGrowthProgress` 的客户端同源口径）。
+ *
+ * ⚠️ 两处都要有：宿主那份给日志/其它消费者，这份给 UI 做「没拿到进度时的回落」。
+ * 判据只读字段，不猜。
+ */
+export function progressLine(progress) {
+  if (!progress || typeof progress !== 'object') return ''
+  const total = typeof progress.totalAccounts === 'number' ? progress.totalAccounts : 0
+  const done = typeof progress.doneAccounts === 'number' ? progress.doneAccounts : 0
+  const slot = total > 0 ? `账号 ${Math.min(done + 1, total)}/${total}` : ''
+  if (progress.running === true) {
+    const current = progress.current && typeof progress.current === 'object' ? progress.current : null
+    const who = current ? String(current.nickname || current.accountId || '') : ''
+    const step = current && typeof current.text === 'string' && current.text.length > 0
+      ? current.text
+      : '准备中'
+    return [who.length > 0 ? `正在跑 ${who}` : '正在跑', step, slot]
+      .filter((part) => part.length > 0)
+      .join(' · ')
+  }
+  const summary = typeof progress.summary === 'string' ? progress.summary : ''
+  if (summary.length > 0) return summary
+  const error = typeof progress.error === 'string' ? progress.error : ''
+  if (error.length > 0) return `执行异常：${error}`
+  return ''
+}
+
+/**
+ * **后台语义**说明（用户明确要求「这个要在画面说明出来」）。
+ *
+ * 事实依据（不是营销话术）：一键领取是**一次宿主侧 RPC**，逐账号循环跑在
+ * 宿主进程里（`collectClaimResults`）。面板切走只影响「结果怎么显示」——
+ * `mounted.current` 置 false 后不再上屏，但宿主那边的请求**不会被打断**，
+ * 且进度表（`src/growth-progress.ts`）与结果日志（`growth-runs.json`）都在宿主侧，
+ * 所以切回来仍能看到「正在执行 / 刚刚完成」。
+ */
+export function backgroundHint() {
+  return '执行在宿主进程里进行：切换渠道、关掉面板、刷新页面都**不会中断**；'
+    + '回来后再点开本面板即可看到进度与「上次执行」结果。进度每 3 秒刷新一次（本地内存，不请求上游）。'
+}
+
+/** 「上次执行」摘要：N 个账号有记录 + 最近一次的时间。 */
+export function lastRunDigest(runs) {
+  const list = Array.isArray(runs) ? runs.filter((run) => run && typeof run.at === 'number' && run.at > 0) : []
+  if (list.length === 0) return '本机还没有执行记录'
+  const latest = list.reduce((max, run) => (run.at > max ? run.at : max), 0)
+  const when = formatLocalTime(latest)
+  return `上次执行：${when}（${list.length} 个账号有记录）`
+}
+
+/** 某个账号上次执行的一行文字（`14:02 · 完成 5 项…`），无记录返回空串。 */
+export function runOf(runs, accountId) {
+  const list = Array.isArray(runs) ? runs : []
+  for (const run of list) {
+    if (!run || run.accountId !== accountId) continue
+    const at = typeof run.at === 'number' ? run.at : 0
+    const when = formatLocalTime(at)
+    const summary = typeof run.summary === 'string' ? run.summary : ''
+    if (when.length === 0 && summary.length === 0) return ''
+    return when.length > 0 ? `${when} · ${summary}` : summary
+  }
+  return ''
+}
+
+/**
+ * 卡片标题（按「是否已读取清单 / 是否正在执行」分流）。
+ *
+ * ⚠️ 与 `growthHeadline` 的区别：那个只看总览是否读到；**未读清单是常态**
+ * （用户要求点了才读），此时标题必须说「N 个账号」而不是「无账号」——
+ * 否则看起来像账号丢了。
+ */
+export function growthCardTitle(state) {
+  const overview = state && typeof state === 'object' ? state.overview : null
+  const progress = state && typeof state === 'object' ? state.progress : null
+  const accountCount = state && typeof state.accountCount === 'number' && state.accountCount > 0
+    ? state.accountCount
+    : 0
+  if (overview && overview.loading === true) return '成长任务中心 · 读取中…'
+  if (progress && progress.running === true) {
+    const total = typeof progress.totalAccounts === 'number' ? progress.totalAccounts : accountCount
+    return `成长任务中心 · 执行中（${total > 0 ? total : accountCount} 个账号）`
+  }
+  if (overview && Array.isArray(overview.accounts) && overview.accounts.length > 0) {
+    const failed = overview.accounts.filter((account) => account && account.ok === false).length
+    return failed > 0
+      ? `成长任务中心 · ${overview.accounts.length} 个账号（${failed} 个读取失败）`
+      : `成长任务中心 · ${overview.accounts.length} 个账号`
+  }
+  return accountCount > 0 ? `成长任务中心 · ${accountCount} 个账号（清单未读取）` : '成长任务中心 · 无账号'
+}

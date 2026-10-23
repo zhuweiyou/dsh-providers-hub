@@ -2296,6 +2296,79 @@ export interface RpcBuddyGrowthOverviewAccount {
 export interface RpcBuddyGrowthOverviewResponse {
   accounts: RpcBuddyGrowthOverviewAccount[]
 }
+
+/**
+ * RPC: 成长任务的**实时进度**（2026-10-23，纯内存、零上游请求）。
+ *
+ * 用户报障：「看不到任务执行进度，至少也要给到一个状态行，告知当前哪个号正在做什么
+ * 任务」。一键领取是一次 RPC 跑几分钟，面板只能轮询宿主侧进度表
+ * （`src/growth-progress.ts`）——本端点就是那个只读窗口。
+ *
+ * ⚠️ **为什么不能用 `buddy.growthOverview` 代替**：那个端点每个账号要打 6 个上游
+ * 请求，用它轮询等于对上游做 DDoS。本端点只读进程内单例，可以每 2s 一次。
+ */
+export interface RpcBuddyGrowthProgressRequest {
+  provider: string
+}
+
+/** 当前正在执行的**一步**。 */
+export interface RpcBuddyGrowthProgressStep {
+  accountId: string
+  nickname: string
+  /** 人类可读，如 `任务 chat_5：发一条对话`、`猫猫旅行`。 */
+  text: string
+  /** 该步骤开始时刻（毫秒）。 */
+  at: number
+}
+
+/** 一轮执行的状态快照。 */
+export interface RpcBuddyGrowthProgressState {
+  /** 本轮唯一 id（前端可据此判断「是不是新的一轮」）。 */
+  runId: string
+  startedAt: number
+  /** 是否仍在执行。⚠️ 它在**宿主进程**里跑 —— 面板切走不会中断。 */
+  running: boolean
+  totalAccounts: number
+  doneAccounts: number
+  /** 当前步骤（`running:false` 时保留最后一次，便于「刚才做了什么」）。 */
+  current?: RpcBuddyGrowthProgressStep
+  finishedAt?: number
+  /** 结束摘要。 */
+  summary?: string
+  /** 整轮异常（护栏兜底）。 */
+  error?: string
+}
+
+/** RPC: 进度响应（没有跑过任何一轮时 `run` 缺省）。 */
+export interface RpcBuddyGrowthProgressResponse {
+  run?: RpcBuddyGrowthProgressState
+}
+
+/**
+ * RPC: **上次执行结果**（零上游请求，只读磁盘上的 `growth-runs.json`）。
+ *
+ * 为什么要单独一条：总览（`buddy.growthOverview`）每个账号要打 6 个上游请求
+ * （2026-10-23 用户报障：「打开插件面板就读取，这样每次都要向上游发 API 请求太多了」）。
+ * ⇒ 打开面板只读这份**本地**记录 + 进度，**任务清单改为点按钮才读**。
+ */
+export interface RpcBuddyGrowthLastRunsRequest {
+  provider: string
+}
+
+/** 单账号的最近一次执行记录（`nickname` 由账号池补，日志里不存）。 */
+export interface RpcBuddyGrowthLastRun {
+  accountId: string
+  nickname?: string
+  at: number
+  summary: string
+  /** 逐项扩展收益结果（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。 */
+  extras?: RpcBuddyGrowthExtras
+}
+
+/** RPC: 上次执行结果响应。 */
+export interface RpcBuddyGrowthLastRunsResponse {
+  runs: RpcBuddyGrowthLastRun[]
+}
 /** RPC: 成长中心任务一键全自动化响应 */
 export interface RpcBuddyGrowthTasksResponse {
   results: RpcBuddyGrowthAccountResult[]
