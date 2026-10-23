@@ -16,7 +16,26 @@ import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 // ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
 // `errorDetail` 各写一条判据必然漂移（见 `openai-compat.ts` 的注释，IKLBSH A1）。
-import { detailFieldText } from './openai-compat.js'
+//
+// ⚠️⚠️ **`serializeMessages` / `collectImages` 也改用共享实现**（2026-10-21）：
+// 本文件原有一份**只处理文本**的私有 `serializeMessages`（注释还写着「其余非
+// 文本块（图片）被丢弃」）。接图片时若在私有那份上再加一条腿，就会变成
+// 「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片提升为
+// 独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度与
+// `collectImages` 对齐）全部踩过了。**故直接复用，不另写。**
+import { collectImages, detailFieldText, serializeMessages } from './openai-compat.js'
+
+/**
+ * 重新导出共享的 `serializeMessages`（**只为了让既有调用方与测试的导入路径不变**）。
+ *
+ * ⚠️ 这里**没有**第二份实现 —— 上面那条 import 就是唯一来源。写成
+ * `export { serializeMessages }` 而不是在这里再包一层，是为了让「有两份实现」
+ * 这件事在类型层面就不可能发生。
+ *
+ * ⚠️ 使用者（`tests/unit/session-replay.spec.ts` 等）测的是「0.1.7 形状与
+ * 0.1.5 形状等价」，判据与实现份数无关，故保留原导入路径即可。
+ */
+export { serializeMessages }
 import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
@@ -377,104 +396,100 @@ export interface CodeArtsAdapterOptions {
    * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
    */
   onCatalogLoaded?: () => void
+  /**
+   * 读图片字节（内联为 data URL 发上游）。
+   *
+   * ## 为什么必须由接线层桥接
+   *
+   * 适配器拿不到 `ctx`，而图片字节在附件服务（`ctx.attachments.readImage`）里。
+   * 接线层用 `makeReadImage(ctx)` 注入 —— 与其余 14 家**同一个**桥接件，
+   * 不另写第二套（本仓纪律：同一语义只留一份实现）。
+   *
+   * ## ⚠️ 只有 VL 模型能收图（实测）
+   *
+   * 见 {@link CODEARTS_VL_MODELS}：`kimi-k2.6-vl` / `Qwen3-VL-235B` 收图 200，
+   * 文本模型（含 `glm-5.3`）一律 `InferHub.001001020.406 The request model is
+   * not multimodal`。故本回调只会在**目标模型声明了 image 模态**时被调用
+   * （模态声明见 `toCatalogEntry` 的 `inputModalities`）。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
 }
 
-/**
- * 将消息内容载荷展平为纯文本字符串。Harness 消息
- * 以 OpenAI 风格的块数组形式携带内容（`[{type:'text',...}]`，且
- * 助手历史可能包含 `{type:'reasoning',...}` 块）；CodeArts
- * 端点会拒绝非 `text` 块类型并返回空流，因此只保留
- * `text` 块并拼接。
- */
-function contentToText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((block): block is { type: string; text: unknown } =>
-      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
-    .map((block) => String(block.text))
-    .join('')
-}
+
 
 /**
- * 将 harness 对话消息序列化为 CodeArts chat-completions 的传输
- * 格式。助手的 `tool-call` 块转换为 `tool_calls` 字段；`reasoning`
- * 块折叠为 `reasoning_content` 字段（deepseek-v4 等推理模型的后端
- * 校验要求 assistant 消息必须携带该字段，缺失会报 "Missing
- * `reasoning_content` field"）；工具结果（搭载在 harness 用户消息中）
- * 展开为独立的 `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
- * 其余非文本块（图片）被丢弃，与端点接受的格式一致。
+ * 能**原生收图**的模型（`supports_images: true`，`model_category: 图片理解`）。
  *
- * ⚠️ 入口先做 **DSH 0.1.7 消息形状归一化**（见 `message-shape.ts`）：0.1.7 把工具
- * 结果改为一等 `role:'tool'` 消息，若不归一化，下面的 `type === 'tool-result'`
- * 判据恒不命中 → 工具调用被 `resolveToolPairing` 整体剔除。
+ * ## 实测（2026-10-21，只读探测 `/v1/model/builtin`，8 条目录逐条核对）
+ *
+ * | 模型 | `supports_images` | `model_category` |
+ * |---|---|---|
+ * | `kimi-k2.6-vl` | **true** | **图片理解** |
+ * | `Qwen3-VL-235B` | **true** | **图片理解** |
+ * | `GLM-5.2` / `glm-5.3` / `glm-5.2-sft-harmony` / `openpangu-2.0-flash` / `openpangu-2.0-pro` / `deepseek-v4.1-flash` | false | 文本生成 |
+ *
+ * ⇒ 只有这两条能收图，其余**发图必被上游拒**：
+ * `{"error_code":"InferHub.001001020.406","error_msg":"The request model is not multimodal"}`
+ * （实测 glm-5.3，见 `CODEARTS_VL_MODELS` 的探测记录）。
+ *
+ * ## ⚠️ 与「VL 模型不进目录」的关系（**刻意保留**）
+ *
+ * `toCatalogEntry` / `catalogEntries` 仍**把 VL 模型从对话目录里过滤掉**
+ *（`-VL-` / `-vl` 判据）—— 它们上下文小、不支持工具调用，当 agent 主模型会
+ * 踩别的坑。本表**只用于两件事**：
+ * 1. 判断「某个模型能不能收图」（{@link codeartsAcceptsImage}）；
+ * 2. `analyzeImage` 工具内部挑一个 VL 模型去做识图（{@link codeartsVisionModel}）。
+ *
+ * 即：**用户仍然不能在模型选择器里选 VL 模型，但主模型可以借它识图** ——
+ * 这与 IDE 自己的行为一致（IDE 也是 `fetchMultimodalModelId` 选一个 VL 模型
+ * 去服务 `analyzeImage` 工具，见 `docs/agent-notes/providers-codearts.md`）。
  */
-export function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
-  const normalized = normalizeHarnessMessages(messages)
-  const wire: Array<Record<string, unknown>> = []
-  // 剔除无法配对的工具调用/结果（详见 resolveToolPairing）：孤儿 tool_calls
-  // 会让后端对之后每一条消息都返回 400，整个会话永久报废。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
-  for (const message of normalized) {
-    if (message.role === 'assistant') {
-      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
-      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
-      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
-      const content = stripCourseLeakFromHistoryContent(
-        message.role,
-        Array.isArray(message.content) ? message.content : [],
-      )
-      const toolCalls = content
-        .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
-          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
-        .filter(block => keepCallIds.has(String(block.id)))
-        .map((block) => ({
-          id: String(block.id),
-          type: 'function' as const,
-          function: { name: String(block.name), arguments: normalizeToolArguments(String(block.arguments)) },
-        }))
-      const reasoning = content
-        .filter((block): block is { type: string; text: unknown } =>
-          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
-        .map((block) => String(block.text))
-        .join('')
-      wire.push({
-        role: 'assistant',
-        content: contentToText(content),
-        // 后端（deepseek-v4-flash/pro）校验要求 assistant 消息必须包含
-        // reasoning_content 字段：历史里的推理块在上一轮被持久化，回传时
-        // 若缺失该字段会直接 400（"Missing `reasoning_content` field"）。
-        // 始终携带该字段（无推理时为空串），确保字段存在。
-        reasoning_content: reasoning,
-        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
-      })
-      continue
-    }
-    if (message.role === 'system') {
-      wire.push({ role: 'system', content: contentToText(message.content) })
-      continue
-    }
-    // user 角色：工具结果搭载在 harness 用户消息中；将每个展开为
-    // 独立的 role:'tool' 传输消息，与 deepseek 适配器的行为一致。
-    const content = Array.isArray(message.content) ? message.content : []
-    const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
-      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
-    // 纯文本 user 消息（字符串 content）需原样传递：contentToText 处理
-    // 字符串时直接返回，但这里不能用 `content`（非数组时为 []）——否则
-    // 字符串 user 消息会被序列化成空串，模型看不到任务指令。
-    const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
-    for (const result of toolResults) {
-      // 丢弃孤儿工具结果：没有对应 tool_call 其结果同样会让后端 400。
-      if (!keepResultIds.has(String(result.toolCallId))) continue
-      wire.push({
-        role: 'tool',
-        tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
-      })
-    }
-  }
-  return wire
+const CODEARTS_VL_MODELS: readonly string[] = ['kimi-k2.6-vl', 'Qwen3-VL-235B']
+
+/**
+ * `analyzeImage` 优先用哪个 VL 模型。
+ *
+ * ⚠️ 取 `kimi-k2.6-vl` 的**依据是 IDE 自己的选择**（不是我们猜的）：本机内核日志
+ * `builtin-model-service` 实测 11 次采样全部是
+ * `[fetchMultimodalModelId] Success, selected multimodal model: kimi-k2.6-vl,
+ *  candidates: kimi-k2.6-vl, Qwen3-VL-235B`
+ * ⇒ IDE 在两个候选里**恒定选它**，我们跟随。
+ */
+const CODEARTS_VISION_MODEL = 'kimi-k2.6-vl'
+
+/** 该模型能否原生收图（大小写不敏感 —— 上游目录里两种写法都出现过）。 */
+export function codeartsAcceptsImage(modelId: string): boolean {
+  const key = modelId.trim().toLowerCase()
+  return CODEARTS_VL_MODELS.some((id) => id.toLowerCase() === key)
+}
+
+/** `analyzeImage` 用哪个 VL 模型（当前恒定返回 {@link CODEARTS_VISION_MODEL}）。 */
+export function codeartsVisionModel(): string {
+  return CODEARTS_VISION_MODEL
+}
+
+/**
+ * 把 harness 的图片块转成 CodeArts 接受的 wire 形态。
+ *
+ * ## ⚠️⚠️ 只有一种形态被接受（2026-10-21 实测四选一）
+ *
+ * 对 `kimi-k2.6-vl` 与 `Qwen3-VL-235B` 各发一张 8×8 纯红 PNG、问「是什么颜色」：
+ *
+ * | 形态 | 结果 |
+ * |---|---|
+ * | **`{type:'image_url', image_url:{url:'data:…'}}`** | **HTTP 200，答「红色」** ✅ |
+ * | `{type:'image_url', image_url:'data:…'}`（字符串） | 406 `InferHub.001001046` multimodal content incorrect |
+ * | `{type:'image', source:{type:'base64',…}}`（Anthropic 系） | 400 `ModelArts.81001` unsupported content type |
+ * | `{type:'input_image', image_url:…}`（Responses 系） | 406 `InferHub.001001046` |
+ *
+ * ⇒ **必须是 OpenAI 的「对象套 url」形态**，且 url 是 base64 data URL。
+ * 反向对照：同一份格式发给文本模型 `glm-5.3` 得
+ * `InferHub.001001020.406 The request model is not multimodal` ⇒ 这条判据有判别力。
+ *
+ * @param dataUrl - 已经拼好的 `data:image/…;base64,…` 串
+ */
+export function codeartsImagePart(dataUrl: string): { type: 'image_url'; image_url: { url: string } } {
+  return { type: 'image_url', image_url: { url: dataUrl } }
 }
 
 /**
@@ -1095,11 +1110,22 @@ export class CodeArtsAdapter extends LlmAdapter {
         product: { id: PROVIDER },
         loadCatalog: () => this.catalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
-        // ⚠️ 未知 id 恒声明 `['text']`（本家是纯文本网关）。
-        // ⚠️ 这是**用户 2026-10-08 裁定的一处行为变更**：原 `resolveModel` 对未知 id
-        //    **省略**该字段（而 `listModels` 却声明 `['text']`，同一家内部不一致）
-        //    ⇒ 统一为声明。影响面为零：CodeArts 是纯文本网关，VL 模型已被滤掉。
-        unknownModelInputModalities: () => ['text'] as const,
+        // ⚠️ 未知 id 的模态：**VL 模型例外**（2026-10-21 接图片时发现）。
+        //
+        // 历史：这里原写死 `['text']`，理由是「本家是纯文本网关、VL 模型已被滤掉」。
+        // 该理由**只对目录内条目成立** —— VL 模型被 `catalogEntries()` 滤掉后，
+        // `resolveModel('kimi-k2.6-vl')` 走的是**未知 id 分支**（`entry === undefined`），
+        // 于是拿到这里的 `['text']`，而 `toCatalogEntry` 里算出的 `['text','image']`
+        // **根本轮不到**（那条只在目录命中时生效）。
+        // ⇒ 症状：VL 模型声明不了 image ⇒ DSH 在**入库阶段**就拒图（真缺陷，
+        //    由 `codearts-image-input.spec.ts` 的守卫 ① 当场抓住）。
+        // ⇒ 修法：按 id 判能力（`codeartsAcceptsImage`），其余仍恒 `['text']`。
+        //
+        // ⚠️ 这也解释了为什么**不能**把 VL 模型放进目录来解决：那会改变「选择器里
+        //    能选到什么」（用户可见行为），而本次只需要「识图工具能按 id 借它」。
+        unknownModelInputModalities: (modelId) => codeartsAcceptsImage(modelId)
+          ? ['text', 'image'] as const
+          : ['text'] as const,
         // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
         // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
         // 原实现对未知 id 同样给这两档。
@@ -1326,8 +1352,15 @@ export class CodeArtsAdapter extends LlmAdapter {
       //    （与 loomy / raccoon / trae / lobsterai 同款，见 `model-catalog.ts`
       //    的 `bareName` 字段注释）。
       bareName: model.name,
-      // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
-      inputModalities: ['text'] as const,
+      // ⚠️ 模态**逐模型判定**（2026-10-21 接图片时改）：VL 模型声明
+      //    `['text','image']`，其余恒 `['text']`。
+      //
+      //    为什么以前是「恒 `['text']`」：那时 VL 模型全被下面的可见性过滤滤掉，
+      //    目录里一条都不剩，所以写死无害。现在 VL 模型**仍不进目录**（理由见
+      //    `CODEARTS_VL_MODELS` 的注释），但 `analyzeImage` 工具会按 id 直接
+      //    `resolveModel('kimi-k2.6-vl')` —— 那条路径必须看到 `image`，
+      //    否则 DSH 的图片准入闸门会在**发请求之前**就拒掉。
+      inputModalities: codeartsAcceptsImage(model.id) ? ['text', 'image'] as const : ['text'] as const,
       // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
       //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
       contextWindow,
@@ -1386,8 +1419,14 @@ export class CodeArtsAdapter extends LlmAdapter {
     model: string,
     signal?: AbortSignal,
   ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    // ⚠️⚠️ **不得在这里再写一次 `inputModalities`**（2026-10-21 接图片时发现）：
+    // 原代码是 `{ ...await this.resolveModel(...), inputModalities: ['text'] }` ——
+    // 即**硬覆盖**目录里刚算出的模态。那与「同一事实写两处」同型：只要目录里
+    // 开始按模型区分模态（VL 收图、文本模型不收），这行就会**静默把它抹平**，
+    // 症状是「VL 模型明明声明了 image，发图仍被 DSH 在入库阶段拒掉」。
+    // ⇒ 模态只由 `toCatalogEntry` 一处决定，这里原样透传。
     return {
-      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] as const },
+      model: await this.resolveModel(provider, model, signal),
       stream: (options: GenerateOptions) => this.stream(options),
     }
   }
@@ -1417,7 +1456,41 @@ export class CodeArtsAdapter extends LlmAdapter {
       if (currentAccountId) reportLedgerAccount(PROVIDER, currentAccountId)
     }
 
-    const messages = serializeMessages(options.messages)
+    // ⚠️ **图片：只有 VL 模型收，且必须走共享实现**（2026-10-21 实测接线）。
+    //
+    //  - 模态闸门：`codeartsAcceptsImage(model)` 为假时**不读字节、不拼 parts**
+    //    ⇒ 请求与改造前逐字节相同（文本模型发图仍会被上游 406，但我们不会
+    //    先把图内联进去浪费一次请求；真正的准入在 DSH 侧由 `inputModalities`
+    //    拦下，见 `toCatalogEntry`）。
+    //  - `imageUrls === undefined` ⇒ 共享 `serializeMessages` 走**纯文本**老路径，
+    //    与改造前一致；非 undefined（含空 Map）时把 user 消息升级为多模态 parts。
+    //    ⚠️ 空 Map 不能降级为 undefined —— 那会让「图片在但字节读失败」的
+    //    `[image unavailable]` 占位符也被跳过，图片静默消失（与 officeace 同因）。
+    let imageUrls: Map<string, string> | undefined
+    if (codeartsAcceptsImage(options.model)) {
+      const imageRefs = new Map<string, unknown>()
+      for (const message of options.messages) {
+        if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+      }
+      if (imageRefs.size > 0) {
+        imageUrls = new Map()
+        for (const [id, ref] of imageRefs) {
+          if (this.options.readImage === undefined) {
+            // 附件服务没接线：留空 Map（图片显示为 `[image unavailable]`），
+            // 而不是抛错把整轮对话打死 —— 与其余家同一取向。
+            continue
+          }
+          try {
+            const image = await this.options.readImage(ref)
+            imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+          } catch {
+            // 单张读失败不拖垮整轮：其余图片照发，这张落占位符。
+          }
+        }
+      }
+    }
+
+    const messages = serializeMessages(options.messages, imageUrls)
     // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
     // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
     // messages 数组里的 system 角色，必须显式插入——否则模型看不到

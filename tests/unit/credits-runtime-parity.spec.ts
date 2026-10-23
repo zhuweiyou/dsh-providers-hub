@@ -602,6 +602,9 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   //    ⚠️ 只写**路径片段**（与本表其余项同口径）：域名在 product 的 `balanceUrl`
   //    里，而它**刻意不是** `baseUrl` 那个 host（见 modelscope-product.ts 的字段注释）。
   modelscope: '/openapi/v1/magicubes/balance',
+  // ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额端点（真凭据实测 200，
+  //    `remaining_points` 是字符串；同域 /api/user/info 等候选均已 404）。
+  codely: '/api/user/usage/summary',
 }
 
 /**
@@ -688,7 +691,10 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     //    `/openapi/v1/magicubes/balance`（带 API Key 返 200、随消耗下降）。
     // ⚠️ 2026-10-20 autoclawintl（AutoClaw 国际版，与国内同端点、只差主机）：16 → 17。
     //    ⚠️ 合并上游时**不要**改回 13。
-    expect(expected.length).toBe(17)
+    // ⚠️ 2026-10-19 **本 fork** 并入 codely（Unity，usage/summary）⇒ 17 → 18。
+    //    它是全仓首例 balance:true + channel:false（登录/余额均为自由函数，
+    //    无 auth 服务；runtime 守卫只查已注册 runtime，codely 被跳过）。
+    expect(expected.length).toBe(18)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

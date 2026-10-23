@@ -138,7 +138,7 @@ export interface ModelCatalogConfig {
    * `CatalogEntry.inputModalities` 的说明）。
    * ⇒ **两个方向都会出真缺陷，故本回调必须逐家提供**，骨架不替各家决定。
    */
-  unknownModelInputModalities?(): readonly ('text' | 'image')[] | undefined
+  unknownModelInputModalities?(modelId: string): readonly ('text' | 'image')[] | undefined
   /**
    * **目录里没有该 id** 时 `resolveModel` 该报什么思考档位。
    *
@@ -679,7 +679,7 @@ export function createModelCatalog(
         // ⇒ 家数**只在上面那个接口字段的表格里维护**，这里**刻意不抄数字**
         // （原先抄了个「10 家」并写成只有 `buddy` 省略，与那张表**互相矛盾**，
         // 正是「同一事实写多处 ⇒ 必有一处先腐坏」）。
-        const unknownModalities = config.unknownModelInputModalities?.()
+        const unknownModalities = config.unknownModelInputModalities?.(model)
         if (unknownModalities !== undefined) resolved.inputModalities = unknownModalities
       }
       // ⚠️ 未知模型**默认不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。

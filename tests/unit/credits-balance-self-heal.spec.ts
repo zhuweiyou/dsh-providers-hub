@@ -639,7 +639,17 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const end = rpcSource.indexOf('}', start)
     expect(end).toBeGreaterThan(start)
     return new Set(
-      [...rpcSource.slice(start, end).matchAll(/readonly (\w+):/g)].map((m) => m[1]!),
+      /**
+       * ⚠️⚠️ 正则必须允许**可选键** `readonly x?:`（2026-10-22 A6）。
+       *
+       * 旧写法 `/readonly (\w+):/` 对 `readonly codely?: CodelyAuth` **不匹配**
+       * （`?` 不在 `(\w+)` 里）⇒ 可选键被**静默当成不存在**
+       * ⇒ 下面那条「Set 里的每一个 id 都必须在 JetHubAuths 里有对应键」
+       * 会把**真实存在的**键报成「假 id（会抛 Unknown provider）」。
+       * ⚠️ 这正是本仓库记过的「判据漏一格 ⇒ 假红/假绿」形态：守卫自己的
+       * 正则也要跟着契约的形状走。
+       */
+      [...rpcSource.slice(start, end).matchAll(/readonly (\w+)\??:/g)].map((m) => m[1]!),
     )
   }
 
@@ -661,6 +671,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     //    refresh 端点 ⇒ 必须进自愈集合。
     CODEBUDDY: 'buddy',
     WORKBUDDY: 'workbuddy',
+    // ⚠️ Codely（Unity，2026-10-22 A6）：常量名 `CODERLY` 与 id `codely` 不同形
+    //    （源码里叫 CODERLY、provider id 叫 codely）—— 同样不能靠大写推。
+    CODERLY: 'codely',
   }
 
   /**
@@ -703,8 +716,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     //    回头改数字）—— 快照式数字必然腐坏（本仓库既有教训）。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'AUTOCLAW_INTL', 'CLINE', 'CODEBUDDY', 'GEMINI', 'LOBSTERAI',
-      'MINIMAX', 'MINIMAX_INTL', 'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE', 'WORKBUDDY',
+      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'AUTOCLAW_INTL', 'CLINE', 'CODEBUDDY', 'CODERLY', 'GEMINI',
+      'LOBSTERAI', 'MINIMAX', 'MINIMAX_INTL', 'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON',
+      'TRAE', 'WORKBUDDY',
     ])
   })
 
@@ -712,9 +726,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
-      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini',
-      'lobsterai', 'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon',
-      'trae', 'workbuddy', ])
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'codely',
+      'gemini', 'lobsterai', 'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn',
+      'raccoon', 'trae', 'workbuddy', ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)
     expect(inSet.has('zcode')).toBe(false)
@@ -760,7 +774,7 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
 
     const expected = PROVIDER_REGISTRY
-      .filter((d) => d.channel && d.credits.balance === true && !NO_REFRESH_ENDPOINT.has(d.id))
+      .filter((d) => d.credits.balance === true && !NO_REFRESH_ENDPOINT.has(d.id))
       .map((d) => d.id)
       .sort()
 

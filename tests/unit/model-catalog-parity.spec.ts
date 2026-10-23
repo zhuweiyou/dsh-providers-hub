@@ -69,6 +69,7 @@ import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
 import { AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
+import { CodelyAdapter } from '../../src/codely-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter, CODEARTS_FALLBACK_CONTEXT_WINDOW } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
@@ -651,6 +652,15 @@ id: 'autoclaw',
         slots: async () => [{ id: 'modelscope', apiKey: 'ms-wire-test-key' }],
       } as never),
     },
+    // ⚠️ Codely（Unity，2026-10-22 A6）：`channel` 已翻 true ⇒ 必须进本表，
+    //    否则它不过本段任何对拍（目录 / 模态 / 窗口 / 档位全部零覆盖）。
+    {
+      id: 'codely',
+      make: () => new CodelyAdapter({
+        ...NO_CRED,
+        credentialProvider: async () => ({ access_token: 'COD', refresh_token: 'R' } as never),
+      } as never),
+    },
     {
       id: 'opencode',
       make: () => new OpencodeAdapter({
@@ -727,7 +737,8 @@ id: 'autoclaw',
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(21)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true` ⇒ 进本表：21 → 22。
+    expect(CASES).toHaveLength(22)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {

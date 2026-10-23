@@ -742,6 +742,28 @@ export function gatewayLoopbackOnly(status) {
 }
 
 /**
+ * `running: true` 但 `address === null`。
+ *
+ * ⚠️ **这是合法组合**（2026-10-22 对抗审计 m-1）：宿主侧 `running`（`isGatewayRunning()`）
+ * 与 `address`（`gatewayAddress()`）是**两次独立 `degrade`**，任一次抛错都会让对应字段为空
+ * ⇒「在跑」与「拿不到地址」可以同时成立。
+ *
+ * 旧实现在这种情况下会：
+ * - `isWildcardHost(undefined)` 抛 `TypeError` ⇒ **整个状态面板崩**（已修：
+ *   `normalizeHostForCompare` 对非字符串返回空串）；
+ * - 修了不崩之后仍会输出「只绑定 127.0.0.1」—— 而开关可能是**开着的**
+ *   ⇒ 又一条与事实相反的安全声明（IKL7UN 那条纪律：暴露面变了就必须明说）。
+ *
+ * ⇒ 判据：**地址未知时不得声称任何暴露面**，只能如实说「拿不到地址」。
+ */
+function gatewayAddressUnknown(status) {
+  if (status?.running !== true) return false;
+  const address = status?.address;
+  return address === null || address === undefined
+    || typeof (address).host !== 'string' || (address).host.trim() === '';
+}
+
+/**
  * 绑了**非回环**地址时的提示行（issue IKL7UN）。
  *
  * ## 为什么这条必须存在
@@ -800,6 +822,13 @@ export function nonLoopbackNotice(status) {
  * @returns {string}
  */
 export function gatewayFootnote(status) {
+  // ⚠️ **地址未知时不得声称任何暴露面**（2026-10-22 m-1）：
+  //    旧实现会落到最后那句「只绑定 127.0.0.1」，而开关可能开着 ⇒
+  //    与事实相反的安全声明。
+  if (gatewayAddressUnknown(status)) {
+    return '网关正在运行，但本次读不到它的监听地址 —— 无法确认它只绑了回环。'
+      + '若你打开了「允许局域网访问」，请按已开启对待（隔离只靠密钥）。';
+  }
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
     return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，`

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { loadOrCreateApiKey, type ApiKeySource } from './auth.js'
-import { gatewayHttpUrl, resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
+import { gatewayHttpUrl, isLoopbackHost, resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
 import { markGatewayChannel } from './channel.js'
 import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens, type OpenAiChatRequest, type ReasoningEffortNotice } from './messages.js'
 import type { AttachmentBridge, ImageLimits } from './images.js'
@@ -528,6 +528,14 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
         throw error
       })
       logger.info(`[openai-gateway] 已监听 ${gatewayHttpUrl(config.host, boundPort, '/v1')}`)
+      // ⚠️ 绑非回环地址时必须留痕（IKL7UN 的 UI/日志文案守则：暴露面变了要明说）。
+      // 这是服务端侧的唯一提示点 —— 设置页有同款警告（gatewayFootnote 的非回环分支）。
+      if (!isLoopbackHost(config.host)) {
+        logger.warn(
+          `[openai-gateway] 网关绑定在 ${config.host}（非回环）：同一网络的其它设备都能连到该端口，`
+          + '隔离只靠 API Key——不要把它配置进任何浏览器端工具或扩展。',
+        )
+      }
     },
     async close(): Promise<void> {
       for (const controller of active) controller.abort()

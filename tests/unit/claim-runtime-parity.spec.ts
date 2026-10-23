@@ -97,7 +97,7 @@ class FakeCredentials {
 function emptyAuths(): Record<string, unknown> {
   const stub = {} as never
   return {
-    codearts: stub, lobsterai: stub, trae: stub, lobsterai: stub,
+    codearts: stub, buddy: stub, workbuddy: stub, lobsterai: stub,
     qoder: stub, qodercn: stub, trae: stub, cline: stub, loomy: stub,
     raccoon: stub, minimax: stub, minimaxintl: stub, zcode: stub, gemini: stub,
     officeace: stub, accio: stub, autoclaw: stub,
@@ -234,7 +234,13 @@ describe('签到能力：registry 声明与 runtime 实现必须一致', () => {
     // ⚠️ 2026-10-16 加 astudio（声明可签到且有 claimDaily 接线）：7 → 8。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，声明可签到）：8 → 9。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版，与国内同源）：9 → 10。
-    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(10)
+    // ⚠️ 2026-10-22 合并审计：codely 现在真的注册了 runtime（`src/index.ts` 里那处
+    //    「有 probe 但不在 `registry` 数组里」的单独注册）⇒ 它第一次进入本循环。
+    //    它的 `claim` 本来就在 `provider-credits.ts` 的 codely 条目里（实测
+    //    `typeof createProviderCredits()['codely'].claim === 'function'`），
+    //    此前**因为 `runtimeOf('codely') === undefined` 被上面那句 `continue` 静默跳过**，
+    //    所以这条守卫此前对 codely 零覆盖。10 → 11。
+    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(11)
   })
 
   /**

@@ -1164,6 +1164,11 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
   ['ACCIO', 'accio'],
   ['AUTOCLAW', 'autoclaw'],
+  // ⚠️ Codely（Unity，2026-10-19）：**UI 先行阶段**就提前登记（registry 里该条
+  //    `channel: false`，但恢复表守卫按**全量** registry 派生、只豁免 aggregate
+  //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
+  //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
+  ['CODELY', 'codely'],
   // ⚠️ 第 18 个 provider（astudio，2026-10-16）—— 同款坑第 **六** 次。
   // 漏加 = `ASTUDIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。

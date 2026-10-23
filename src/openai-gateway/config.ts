@@ -75,6 +75,19 @@ const INVISIBLE = /[\p{Cf}\p{Cc}\p{Cs}\p{Mn}\p{Me}\p{Zs}\p{Zl}\p{Zp}]/gu
  * {@link stripHostBrackets}，它**保留 zone id** —— 见那里的注释。
  */
 function normalizeHostForCompare(host: string): string {
+  // ⚠️⚠️ **非字符串必须当空串**（2026-10-22 对抗审计 m-1）：
+  //   本函数是 `isWildcardHost` / `isLoopbackHost` 的**唯一归一化入口**，
+  //   而客户端（`openai-gateway-panel.js`）会拿 `status.address?.host` 直接调它。
+  //   实测：`running:true` + `address:null` 是**合法组合**（宿主侧 `running`与
+  //   `address` 是两次独立 `degrade`）⇒ `undefined.normalize()` 抛
+  //   `TypeError: Cannot read properties of undefined (reading 'normalize')`
+  //   ⇒ **整个网关状态面板直接崩**（用户只看到一片空白）。
+  //
+  // ⚠️ 归为**空串**是异常方向正确的：
+  //   - 对 `isWildcardHost`：空串 ⇒ `true`（当成通配、**拒绝**）—— fail-closed；
+  //   - 对 `isLoopbackHost`：空串 ⇒ `true`（当成回环）—— 与它“空 host 不告警”的既有语义一致。
+  //   两者都比「报 TypeError」好。
+  if (typeof host !== 'string') return ''
   let value = host.normalize('NFKC').replace(INVISIBLE, '')
   // 剥方括号与端口。⚠️ `\d*`（不是 `\d+`）：`[::]:` 的空端口也要剥掉。
   const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value)

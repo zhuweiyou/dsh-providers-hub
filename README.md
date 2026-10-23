@@ -8,8 +8,14 @@ DeepSeek Harness 插件：把多家 AI 编程服务的账号统一接进 DSH 的
 
 ## 安装
 
+### Desktop 版
+
+在 DSH 桌面端的插件安装入口里**直接填写插件名称** `dsh-providers-hub` 即可。
+
+### Web 版
+
 ```sh
-dsh plugin --profile <name> add dsh-providers-hub
+dsh plugin --profile web add dsh-providers-hub
 ```
 
 包内已包含编译产物（`lib/`），装完即用，不需要再构建。升级同样是再执行一次
@@ -28,7 +34,7 @@ dsh plugin --profile <name> add dsh-providers-hub
 
 ## 支持的渠道
 
-21 个渠道，外加 1 个 `aggregate` 聚合路由：
+22 个渠道，外加 1 个 `aggregate` 聚合路由：
 
 | 服务 | 渠道 id |
 |---|---|
@@ -53,6 +59,7 @@ dsh plugin --profile <name> add dsh-providers-hub
 | OpenCode | `opencode` |
 | Gemini Code Assist | `gemini` |
 | 魔搭 ModelScope | `modelscope` |
+| Codely（Unity 团结引擎） | `codely` |
 
 ## 首次使用
 

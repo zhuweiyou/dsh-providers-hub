@@ -223,6 +223,22 @@ const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   // **新的**真实凭据都会当场变红，而这两条是「已知的、已决策的」。
   'zsak6eadrbawz683wf5r3m2snrwj868r',  // 讯飞 Loomy AccessKeySecret
   'tmgEeM2rd9ybYoWpXl8JqUfvK',         // Cline WorkOS refresh_token
+  // ⚠️ **PR #3（codely）新增的两个测试夹具**（2026-10-22 合并审计补登记）。
+  //    它们在 `codely-adapter.spec.ts:40-41` 与 `codely-checkin.spec.ts:24-25` 里，
+  //    值形如 `access-token-abc` / `refresh-token-abc` —— **明显构造**（`-abc` 后缀），
+  //    不是真实凭据。按本仓纪律**逐条登记**，不用「含 token 字样就放过」这类启发式。
+  'access-token-abc',
+  'refresh-token-abc',
+  // ⚠️ **`minimax-identity.spec.ts` 的夹具**（2026-10-23 补登记，Gitee IKP8UA 引入）。
+  //
+  // `access_token: 'mmoat_test_token'` 恰好 16 位（判据的下限），故被
+  // 「凭据字段名 + 高熵字面量」命中。**它是构造值不是真凭据**：
+  // `mmoat_` 是 MiniMax 的 token **前缀**（实测真 token 为该前缀 + 60 字符），
+  // 而这里后半段就是字面的 `test_token`（10 个字符，零随机性）。
+  //
+  // ⚠️ 不用「含 `_test_` 就放过」这类启发式 —— 那会让真凭据起个 `mmoat_test_`
+  // 前缀就溜过去。按本仓纪律**逐条登记**。
+  'mmoat_test_token',
 ])
 
 /** 构造示例号码白名单（见文件头）。 */
@@ -376,6 +392,57 @@ describe('仓库内不得残留真实个人敏感信息', () => {
    *
    * 审计里已登记过同型教训：判据写错时，会「因为扫不到东西」而恒绿。
    */
+  /**
+   * ★★ **机器本地的会话导出不得入库**（2026-10-22 对抗审计 M-4）。
+   *
+   * ## 真实缺陷
+   *
+   * PR #1 把 `Codely` 官方 CLI 的 **6 个会话导出文件**（`~223 KB`）提交进了仓库：
+   * `.codely-cli/auto-saves/chat-auto-save-*.json` 与 `chat-export-*.md`。它们含
+   * **完整会话正文** + **本机绝对路径**（实测 `F:\AIProject\deepseek-harness-codearts`）。
+   * 而 `.gitignore` 当时**没有任何规则**挡它——与 `.e2e-logs/` 完全同型（那次也是
+   * 「运行产物被 `git add .` 一起带上」）。
+   *
+   * ## 为什么上面那几条判据抓不到它
+   *
+   * 那些判据找的是「手机号 / 邮箱 / 密钥 / JWT」，而这类文件的危害是
+   * **完整对话与本机路径** —— 它可能一个敏感字面量都没有，但把用户的
+   * 工作目录结构与对话内容全部泄露。
+   *
+   * ## 判据为什么是「路径形状」而不是「内容」
+   *
+   * 内容每次都不同、无法枚举；而这类产物的**路径形状是固定的**
+   * （`<客户端>目录/auto-saves/`）。用路径判据可追加新的客户端目录，
+   * 不会因为「内容里正好没敏感词」而放行。
+   */
+  it('★★ 机器本地的会话导出目录不得入库（导出与自己的聊天记录都是私人数据）', () => {
+    const list = execFileSync('git', ['ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    const tracked = list.split(/\r?\n/).filter((p) => p.length > 0)
+    // ⚠️ 判据是「目录名 + auto-saves」的组合，不是某一个具体渠道名
+    //    （否则换个客户端就又漏了）。
+    const offenders = tracked.filter((p) => /(^|\/)(\.?[a-z0-9-]*cli|agent|client)?\/?auto-saves\//i.test(p)
+      || /^\.[a-z0-9-]+\/(auto-saves|chats?|conversations?|sessions?)\//i.test(p))
+    expect(
+      offenders,
+      '发现机器本地的会话导出被入库（含完整对话 + 本机绝对路径）⇒ '
+      + '从索引移除并加进 .gitignore（参看 `.codely-cli/` 那条）',
+    ).toEqual([])
+  })
+  /**
+   * ⚠️ **本条的自证**：判据必须能命中真实形状（否则就是同义反复）。
+   *     用的是 PR #1 里真实存在过的那些路径。
+   */
+  it('会话导出判据在真实路径上确实命中', () => {
+    const isExportPath = (p: string): boolean =>
+      /(^|\/)(\.?[a-z0-9-]*cli|agent|client)?\/?auto-saves\//i.test(p)
+      || /^\.[a-z0-9-]+\/(auto-saves|chats?|conversations?|sessions?)\//i.test(p)
+    expect(isExportPath('.codely-cli/auto-saves/chat-auto-save-2026-10-20-11-04-49-194.json')).toBe(true)
+    expect(isExportPath('.codely-cli/auto-saves/chat-export-auto-save-2026-10-20-11-12-52-730.md')).toBe(true)
+    // 反向：正常源码不得被误伤
+    expect(isExportPath('src/codely-cli.ts')).toBe(false)
+    expect(isExportPath('tests/unit/codely-adapter.spec.ts')).toBe(false)
+    expect(isExportPath('docs/agent-notes/providers-codearts.md')).toBe(false)
+  })
   it('新增的判据在未脱敏前确实能命中', () => {
     expect('-----BEGIN RSA PRIVATE KEY-----'.match(PEM_PRIVATE_KEY)).not.toBeNull()
     expect('sk-abcdefghijklmnopqrstuvwx'.match(SK_STYLE_KEY)).not.toBeNull()

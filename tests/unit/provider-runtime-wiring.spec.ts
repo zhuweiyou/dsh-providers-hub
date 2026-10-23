@@ -64,6 +64,8 @@ import {
  */
 const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   ['codearts', 'codeartsAuth'],
+  ['buddy', 'buddyAuth'],
+  ['workbuddy', 'workbuddyAuth'],
   ['lobsterai', 'lobsteraiAuth'],
   ['qoder', 'qoderAuth'],
   ['qodercn', 'qodercnAuth'],
@@ -96,10 +98,6 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
   //    不凭注释推断。
   ['modelscope', 'modelscopeAuth'],
-  // ⚠️ buddy 系（本仓库保留的渠道，2026-10-22 合并上游后补回）：服务名由
-  //    `${product.id}Auth` 派生 ⇒ `buddyAuth` / `workbuddyAuth`。
-  ['buddy', 'buddyAuth'],
-  ['workbuddy', 'workbuddyAuth'],
 ]
 
 /**
@@ -245,7 +243,43 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   it('注册表覆盖全部可续期 provider，且**不含** opencode / aggregate / auto', () => {
     applyOnce()
     const ids = registeredRuntimeIds().sort()
-    expect(ids).toEqual(AUTH_SERVICE_OF.map(([id]) => id).sort())
+    // ⚠️ **不是「恰好等于有 auth 的集合」**（2026-10-22 合并审计改）。
+    //
+    // 原判据隐含「**有 runtime ⇔ 有 auth**」这条假设，而 PR #3 引入了第一个反例：
+    // **codely 有 `probe` 与 `credits`、但没有 auth 服务**（`channel:false`，
+    // 登录/余额都是自由函数）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在「`for (const [id, auth] of registry)`
+    // 循环体内」被挂上（`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+    // 而 codely 不在那个数组里 ⇒ `runtimeOf('codely') === undefined` ⇒
+    // `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型：
+    //    「它没有 `rateLimit: false` 豁免 ⇒ 客户端『重测』按钮会渲染 ⇒ 用户点了
+    //    必报『没有探测适配器』」⇒ 正确修法是**让 probe 可达**，
+    //    **不是**把 codely 塞进 `PROBE_EXEMPT`。
+    //
+    // ⇒ 判据：**有 auth 的必须有 runtime**（原意图不放宽）+ `probeById` 的那些也允许有；
+    //   `opencode` / `aggregate` / `auto` 仍不得有（下面三条不变）。
+    const authIds = AUTH_SERVICE_OF.map(([id]) => id).sort()
+    for (const id of authIds) {
+      expect(ids, `有 auth 的 ${id} 必须有 runtime`).toContain(id)
+    }
+    // ⚠️ **额外允许的、无 auth 但有 probe 的家**（本仓当前**只有 codely**）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在上面那个
+    // `for (const [id, auth] of registry)` 循环体内被挂上，而 codely 不在那个
+    // 数组里（`channel:false`、无 auth 服务）⇒ `runtimeOf('codely') === undefined`
+    // ⇒ `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    //
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型
+    //   （「没有 `rateLimit: false` 豁免 ⇒ 『重测』按钮会渲染 ⇒ 用户点了必报
+    //   『没有探测适配器』」）⇒ 正确修法是**让 probe 可达**，不是塞进豁免表。
+    //
+    // ⚠️ **刻意不含 `opencode`**：它虽然也在 `probeById` 里且无 runtime，
+    //   但那是**存量缺陷**（master 上就如此），修它会牵动另一批守卫，不在本次
+    //   范围内 ⇒ 下面仍显式断言它不得有 runtime，把这条缺口**如实留在这里**。
+    const PROBE_ONLY_NO_AUTH = ['codely']
+    expect(ids).toEqual([...new Set([...authIds, ...PROBE_ONLY_NO_AUTH])].sort())
     // opencode 凭据是静态 API key，没有续期概念 ⇒ 刻意不注册（见设计文档 §3.3）。
     expect(ids).not.toContain('opencode')
     // aggregate / auto 是虚拟 provider，无账号无凭据。
@@ -322,6 +356,9 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
    */
   it('重复 apply() 不抛错（fiber 重启竞态：保留先注册者、跳过本次）', () => {
     const first = applyOnce()
+    const firstBuddy = first.buddyAuth
+    expect(firstBuddy).toBeDefined()
+    expect(runtimeOf('buddy')?.auth).toBeDefined()
 
     // 第二个 ctx 同样要备齐服务替身，否则抛的是
     // `Cannot read properties of undefined (reading 'registerAdapter')`
@@ -335,7 +372,10 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
 
     // ⚠️ 保留的是**先注册者**（第一个 ctx 的实例），不是后来者 ——
     //    这正是「先注册者静默失效」不会发生的那一半证据。
+    expect(runtimeOf('buddy')?.descriptor).toBe(descriptorOf('buddy'))
+    expect(second.buddyAuth).not.toBe(firstBuddy)
     // 第二次 apply 的实例**确实**建出来了（否则上面那条 `not.toBe` 是同义反复）。
+    expect(second.buddyAuth).toBeDefined()
   })
 
   /**
@@ -372,12 +412,21 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
       '右侧多出 = registry 里有而清单漏登记）',
-    ).toEqual(shouldRegister)
+    // ⚠️ **`shouldRegister` 是「有 auth 的家」，而 codely 无 auth 却有 runtime**
+    //   （2026-10-22 合并审计修：`probe` 域只在那唯一一个循环里挂，codely 不在
+    //   那个 `registry` 数组里 ⇒ `runtimeOf('codely') === undefined` ⇒ 用户点
+    //   「重测」必报「codely 没有探测适配器」）。⇒ 反向断言同样要把它算进来，
+    //   否则「修好了」这件事本身会让本条变红。理由与上面那条用例同源。
+    // ⚠️ 2026-10-22（A6）：codely 现已翻 `channel: true` 并接入 auth ⇒ 它**已在**
+    //    `shouldRegister` 里，不得再额外加 `'codely'`（会重复。旧写法是它当时
+    //    无 auth 却有 runtime 的补丁；现在两者同源）。
+    ).toEqual([...shouldRegister].sort())
   })
 })
 
@@ -404,6 +453,7 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
    * 将来该文件真的加了写点，那条用例会红并要求填上 provider。
    */
   const WRITE_SITE_FILES: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ['buddy-adapter.ts', ['buddy', 'workbuddy']],
     ['lobsterai-adapter.ts', ['lobsterai']],
     ['qoder-adapter.ts', ['qoder', 'qodercn']],
     ['cline-adapter.ts', ['cline']],
@@ -426,10 +476,6 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    ⚠️ 2026-10-15：国际版与它**共用同一个适配器类** ⇒ 同样会写标记，
     //    故两个 id 并列在这一行（漏一个都会让该站的限流标记清不掉）。
     ['minimax-adapter.ts', ['minimax', 'minimaxintl']],
-    // ⚠️ buddy 系（本仓库保留）：`buddy-adapter.ts` **会写** `modelRateLimits`
-    //    （`markLimited` 注入点 + 两处 `accountPool.updateModelRateLimit`）
-    //    ⇒ 它必须同时出现在 `probeById` 里（否则标记写进去却永远清不掉）。
-    ['buddy-adapter.ts', ['buddy', 'workbuddy']],
     // ↓ 实测不写标记的（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
     ['aggregate-adapter.ts', []],
     ['auto-adapter.ts', []],
@@ -451,6 +497,16 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    `markLimited` / `updateModelRateLimit`）：限流与额度由讯飞 MAAS 侧按账号
     //    配额管理，本地标记清不掉配额（与 officeace 同因）。留空是**被验证的声明**。
     ['astudio-adapter.ts', []],
+    // ⚠️ codely（Unity 团结引擎）**会写** `modelRateLimits`（2026-10-20）：
+    //    ① 推理改为 HTTP 自签直连（签名已还原，`codely-sign.ts`）⇒ 真会收到
+    //       上游的 402 预算耗尽 / 429 限流响应；
+    //    ② 同日接上请求级换号 + 冷却（额度耗尽 → UTC+8 次日 0 点、429 → 1h）
+    //       ⇒ 它**确实是**写点文件，必须登记并与 `WRITES_RATE_LIMIT_PROVIDERS`
+    //       / `probeById` 三处同步（否则标记写进去永远清不掉）。
+    //    ⚠️ 它**曾**登记为 `[]`（不写标记）—— 这个变化正是下面那条
+    //    「登记为不写标记的确实没有写点」用例**红**出来的，与 minimax 2026-10-11、
+    //    accio 2026-10-18 两次同型。用户报障「用完积分怎么不自动切账号」即由此而来。
+    ['codely-adapter.ts', ['codely']],
   ]
 
   /**

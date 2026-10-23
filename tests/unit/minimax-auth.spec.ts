@@ -352,7 +352,14 @@ describe('persistLogin / fetchModels', () => {
     expect(auth.credentialRefName).toBe('MINIMAX_ACCESS_TOKEN')
     const result = await auth.persistLogin({ ...CRED }, { refName: 'MINIMAX_ACCOUNT_X1', nickname: 'X1' })
     expect(written).toEqual(['MINIMAX_ACCOUNT_X1'])
-    expect(result).toEqual({})
+    // ⚠️ **2026-10-23（Gitee IKP8UA）口径变更**：`persistLogin` 现在回传
+    // `nickname`（供 RPC 层写账号池）。显式传入的 nickname 原样回传 ——
+    // 这**不是**行为回退：返回值多一个字段，而调用方读的是 `result.nickname`
+    // （缺省时才走三级回退）。
+    //
+    // 原断言是 `toEqual({})`，那是在「返回值只有 `accountId`」时代写的；
+    // 现在 `accountId` 对它仍是 undefined（token 非 JWT），故只有 `nickname`。
+    expect(result).toEqual({ nickname: 'X1' })
   })
 
   it('⚠️ fetchModels 从 getAvailableAccount 的 credential 字段取凭据（两层结构，不是 available.id）', async () => {

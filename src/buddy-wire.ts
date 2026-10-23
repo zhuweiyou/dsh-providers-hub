@@ -154,6 +154,7 @@ export function prepareBuddyBody(
   clampGptMinMaxTokens(body, ctx.model)
   ensureStreamOptions(body)
   normalizeToolChoice(body)
+  normalizeEmptyToolParameters(body)
   unescapeSchemaPatterns(body)
   normalizeDeveloperRole(body)
   normalizeImageUrlParts(body)
@@ -260,6 +261,36 @@ export function normalizeToolChoice(body: Record<string, unknown>): void {
     return
   }
   delete body['tool_choice']
+}
+
+/**
+ * 归一无参数工具的空 schema。
+ *
+ * DSH 宿主允许 `parameters: {}` 表示「不接收任何参数」，但 Buddy 网关的
+ * `invalid_function_call_parameters` 校验要求函数参数根节点明确是 object。
+ * 因此只在参数 schema 确实为空对象时补成等价的
+ * `{ type: 'object', properties: {} }`，不改动含有其它关键字的 schema。
+ */
+export function normalizeEmptyToolParameters(body: Record<string, unknown>): void {
+  const tools = body['tools']
+  if (!Array.isArray(tools)) return
+  for (const raw of tools) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+    const tool = raw as Record<string, unknown>
+    normalizeEmptyParametersNode(tool['parameters'])
+    const fn = tool['function']
+    if (typeof fn === 'object' && fn !== null && !Array.isArray(fn)) {
+      normalizeEmptyParametersNode((fn as Record<string, unknown>)['parameters'])
+    }
+  }
+}
+
+function normalizeEmptyParametersNode(node: unknown): void {
+  if (typeof node !== 'object' || node === null || Array.isArray(node)) return
+  const schema = node as Record<string, unknown>
+  if (Object.keys(schema).length !== 0) return
+  schema['type'] = 'object'
+  schema['properties'] = {}
 }
 
 /**
