@@ -74,6 +74,9 @@ const GLM_MODEL_NAME = 'GLM-5.2'
 export const GROWTH_TASKS_PATHS = ['/v2/activity/growth/tasks', '/activity/growth/tasks'] as const
 /** 任务接取端点。 */
 export const GROWTH_TASK_ACCEPT_PATH = '/activity/growth/tasks/accept'
+
+/** 逐项领奖路径前缀（<prefix><task_code>/claim，与 accept 同域、同口径）。 */
+export const GROWTH_TASK_CLAIM_PREFIX = '/activity/growth/tasks/'
 /** 旅行状态查询端点。 */
 export const GROWTH_TRAVEL_STATUS_PATH = '/activity/growth/buddy/travel/status'
 /** 旅行领奖端点。 */
@@ -303,9 +306,25 @@ export interface ClaimResult {
 /** 完成动作的映射项。 */
 export interface GrowthTaskSpec {
   /** 动作类型。 */
-  kind: 'canvas' | 'chat' | 'canvasThenChat' | 'webClick' | 'appearance' | 'skillFresh'
+  kind:
+    | 'canvas'
+    | 'chat'
+    | 'canvasThenChat'
+    | 'webClick'
+    | 'appearance'
+    | 'skillFresh'
+    /** 小程序口径对话任务（判据 = mp 指纹的 `chat_request_send`，按 target 补量）。 */
+    | 'mpChat'
+    /** 小程序口径专家对话（判据 = mp 指纹的 `expert_actual_use`）。 */
+    | 'mpExpert'
+    /** 小程序口径的预留任务：复用 PC 侧事件组尝试点亮（判据未完全逆向）。 */
+    | 'mpEvent'
   /** 展示名。 */
   label: string
+  /** `mpChat` 专用：事件是否必须带 `activityId`（`school_season` 必带）。 */
+  withActivityId?: boolean
+  /** `mpChat` 专用：事件是否带模型字段（`Sequential_Tasks_5`，判据待实测）。 */
+  model?: { id: string; name: string }
 }
 
 /** {@link runGrowthTaskCompletions} 的选项。 */
@@ -316,6 +335,21 @@ export interface GrowthCompletionOptions {
    * 而 `NaN > 0` 为 false，若不显式区分会静默变成不限时，恰是本预算要防的情况。
    */
   budgetMs?: number
+  /**
+   * 小程序口径对话事件的**事件间隔**（毫秒）。缺省 {@link MP_CHAT_EVENT_GAP_MS}。
+   *
+   * ⚠️ **这不是节流参数，是判据参数**：上游对「小程序内完成 N 次有效对话」有反作弊
+   * 校验，数秒级连发的事件会先短暂计数、随后被判定无效**整体回滚**（参考实现实测：
+   * 2s 连发 4 条全灭、45s 间隔逐条上报全存活）。传 0 只允许在单测里用。
+   */
+  mpChatEventGapMs?: number
+  /**
+   * 进度回调（可选）：每进入一个动作前叫一次（人类可读），供面板状态行显示。
+   *
+   * ⚠️ 契约：**永不抛错、允许高频**。实现方（本文件）只把它当纯观测通道 ——
+   * 它坏了不得影响领取结果，故所有调用点都包在既有的 try 内。
+   */
+  onStep?: (step: string) => void
 }
 
 /** {@link runGrowthTaskCompletions} 的单项结果。 */
@@ -353,12 +387,12 @@ export interface EventSequenceOptions {
 }
 
 /** 一次成长端点调用的原始结果。 */
-type GrowthCallResult =
+export type GrowthCallResult =
   | { ok: true; status: number; body: GrowthEnvelope }
   | { ok: false; nonJson?: boolean; status?: number; message: string }
 
 /** 写端点响应的三分类。 */
-type GrowthWriteResult =
+export type GrowthWriteResult =
   | { state: 'success'; data: Record<string, unknown> }
   | { state: 'no-object'; message: string }
   | { state: 'failed'; code?: number; message: string }
@@ -463,7 +497,7 @@ function growthHeadersWithConversation(
 }
 
 /** 从 JSON 安全读取字符串。 */
-function readString(source: unknown, key: string): string {
+export function readString(source: unknown, key: string): string {
   if (typeof source !== 'object' || source === null) {
     return ''
   }
@@ -472,7 +506,7 @@ function readString(source: unknown, key: string): string {
 }
 
 /** 从 JSON 安全读取数字（非有限或非数字归 0）。 */
-function readNumber(source: unknown, key: string): number {
+export function readNumber(source: unknown, key: string): number {
   if (typeof source !== 'object' || source === null) {
     return 0
   }
@@ -481,7 +515,7 @@ function readNumber(source: unknown, key: string): number {
 }
 
 /** 把端点基址尾斜杠去掉，避免拼出 `//`。 */
-function baseOf(product: BuddyProduct): string {
+export function baseOf(product: BuddyProduct): string {
   return String(product.endpoint).replace(/\/+$/, '')
 }
 
@@ -494,7 +528,7 @@ function baseOf(product: BuddyProduct): string {
  * 像服务端问题，真因（本插件缺配置）却毫无线索。这类「不崩但静默错」比崩溃更难查。
  * （感谢 contributor 在 !62 复审中指出，原文见该 PR 讨论。）
  */
-function claimBaseOf(product: BuddyProduct): string {
+export function claimBaseOf(product: BuddyProduct): string {
   const raw = typeof product.claimBase === 'string' ? product.claimBase.trim() : ''
   return raw.replace(/\/+$/, '')
 }
@@ -509,7 +543,7 @@ function claimBaseOf(product: BuddyProduct): string {
  * 回退顺序：`webBase` → `claimBase` → `''`（两站当前同主机，但取不到时宁可返回空
  * 让调用方报可读错误，也不要拼出 `undefined/...` 这种能发出去却指向本地缺配置的 URL）。
  */
-function webBaseOf(product: BuddyProduct): string {
+export function webBaseOf(product: BuddyProduct): string {
   const explicit = typeof product.webBase === 'string' ? product.webBase.trim() : ''
   if (explicit.length > 0) {
     return explicit.replace(/\/+$/, '')
@@ -525,12 +559,16 @@ function sha256Hex(input: unknown): string {
 /** 构造成长中心请求头。与签到请求头（`credits.ts` 的 `checkinHeaders`）同款口径：
  * `X-Domain` 以**产品配置**为准而非凭据快照，避免国际版旧凭据把身份标识发错区域。
  * 额外带 `X-Client-Platform: web`（成长中心前端固定该头，签到端点不带）。 */
-function growthHeaders(credential: BuddyCredential, product: BuddyProduct): Headers {
+function growthHeaders(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  platform: GrowthPlatform = 'web',
+): Headers {
   const headers = new Headers()
   headers.set('Authorization', `Bearer ${credential.access_token}`)
   headers.set('Accept', 'application/json')
   headers.set('Content-Type', 'application/json')
-  headers.set('X-Client-Platform', 'web')
+  headers.set('X-Client-Platform', platform)
   headers.set(HTTP_HEADER_DOMAIN, product.apiDomain || credential.domain || '')
   headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
   headers.set(HTTP_HEADER_PRODUCT_CODE, product.productCode)
@@ -560,11 +598,12 @@ async function growthJson(
   product: BuddyProduct,
   body: unknown,
   fetcher: typeof fetch,
+  platform: GrowthPlatform = 'web',
 ): Promise<GrowthCallResult> {
   try {
     const response = await fetcher(`${product.endpoint}${path}`, {
       method,
-      headers: growthHeaders(credential, product),
+      headers: growthHeaders(credential, product, platform),
       body: method === 'POST' && body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
@@ -590,25 +629,39 @@ async function growthJson(
 }
 
 /** 成长读端点（GET）请求。任务列表 / 旅行状态等。 */
-function getGrowthJson(
+export function getGrowthJson(
   path: string,
   credential: BuddyCredential,
   product: BuddyProduct,
   fetcher: typeof fetch,
+  platform: GrowthPlatform = 'web',
 ): Promise<GrowthCallResult> {
-  return growthJson('GET', path, credential, product, undefined, fetcher)
+  return growthJson('GET', path, credential, product, undefined, fetcher, platform)
 }
 
 /** 成长写端点（POST）请求。接取 / 领奖 / 盲盒 / 抽奖 / 首Buddy。 */
-function postGrowthJson(
+export function postGrowthJson(
   path: string,
   credential: BuddyCredential,
   product: BuddyProduct,
   body: unknown,
   fetcher: typeof fetch,
+  platform: GrowthPlatform = 'web',
 ): Promise<GrowthCallResult> {
-  return growthJson('POST', path, credential, product, body, fetcher)
+  return growthJson('POST', path, credential, product, body, fetcher, platform)
 }
+
+/**
+ * 成长域的**来源端标记**（`X-Client-Platform`）。
+ *
+ * ⚠️ 它是**请求口径**，不是装饰：小程序专属任务（`school_season` /
+ * `Sequential_Tasks_*`）**只在小程序口径的列表里下发**，而它们的 accept / claim
+ * 也要求同一个头（缺头 upstream 回 `task not found`）。详见 {@link MP_TASK_CODES}。
+ */
+export type GrowthPlatform = 'web' | 'miniprogram'
+
+/** 小程序口径的头值。 */
+export const MP_PLATFORM: GrowthPlatform = 'miniprogram'
 
 /** 把「响应不是 JSON」整理成可读原因（同签到端点口径）。 */
 function describeNonJsonResponse(status: number, text: string): string {
@@ -655,7 +708,7 @@ function isNoObjectMessage(message: string): boolean {
  *   —— 这是**正常的幂等终态**，不是失败。
  * - `failed`：其余（含 code 400 但 msg 是 `task not completed` 这类真失败）。
  */
-function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
+export function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
   if (!result.ok) {
     return { state: 'failed', message: result.message }
   }
@@ -722,6 +775,12 @@ export async function fetchGrowthTaskCodes(
   let anyOk = false
   /** 首个失败原因（供下游区分「凭据失效」与「没有任务」，见 GrowthTaskQuery.message）。 */
   let failureMessage = ''
+  // ── 三源并集：web 两族 + 小程序口径（见 MP_TASK_CODES 的实测表）─────────────
+  //
+  // ⚠️ 2026-10-23 只读探针实测：mp 列表**不是** web 的超集（反而漏了 9 项常规任务），
+  //    故必须**取并集**且以 web 为准（web 的状态字段更完整：accept_status + progress）。
+  const items: GrowthTaskItem[] = []
+  const seenCodes = new Set<string>()
   for (const path of GROWTH_TASKS_PATHS) {
     const result = await getGrowthJson(path, credential, product, fetcher)
     if (!result.ok || result.body.code !== 0) {
@@ -734,48 +793,61 @@ export async function fetchGrowthTaskCodes(
       continue
     }
     anyOk = true
-    const tasks = tasksOf(result)
-    total += tasks.length
-    for (const task of tasks) {
-      if (typeof task !== 'object' || task === null) {
-        continue
+    for (const task of tasksOf(result)) {
+      const code = readString(task, 'task_code') || readString(task, 'code')
+      if (code.length > 0 && seenCodes.has(code)) continue
+      if (code.length > 0) seenCodes.add(code)
+      items.push(task)
+    }
+  }
+  // mp 口径失败 / 为空都**不算失败**（活动期结束就没有这些任务），只补 web 没下发的码。
+  for (const task of await fetchMpTaskItems(credential, product, fetcher)) {
+    const code = readString(task, 'task_code') || readString(task, 'code')
+    if (code.length === 0 || seenCodes.has(code)) continue
+    seenCodes.add(code)
+    items.push(task)
+    anyOk = true
+  }
+  total = items.length
+  for (const task of items) {
+    if (typeof task !== 'object' || task === null) {
+      continue
+    }
+    // 两族的码字段不同：`task_code`（成长）/ `code`（等级）。
+    const taskCode = readString(task, 'task_code') || readString(task, 'code')
+    if (!AUTOMATABLE_TASK_CODES.has(taskCode) && !MP_TASK_CODES.has(taskCode)) {
+      continue
+    }
+    const progress = task.progress ?? {}
+    const acceptStatus = readString(task, 'accept_status')
+    if (acceptStatus !== '') {
+      // 成长族（含 mp 专属）：按 progress 与 accept_status 判定。
+      progressByCode[taskCode] = {
+        current: readNumber(progress, 'current'),
+        target: readNumber(progress, 'target') || 1,
       }
-      // 两族的码字段不同：`task_code`（成长）/ `code`（等级）。
-      const taskCode = readString(task, 'task_code') || readString(task, 'code')
-      if (!AUTOMATABLE_TASK_CODES.has(taskCode)) {
-        continue
-      }
-      const progress = task.progress ?? {}
-      const acceptStatus = readString(task, 'accept_status')
-      if (acceptStatus !== '') {
-        // 成长族：按 progress 与 accept_status 判定。
-        progressByCode[taskCode] = {
-          current: readNumber(progress, 'current'),
-          target: readNumber(progress, 'target') || 1,
-        }
-        if (includeInProgress) {
-          if (
-            acceptStatus === 'not_accepted' ||
-            acceptStatus === 'in_progress' ||
-            acceptStatus === 'accepted'
-          ) {
-            pending.push(taskCode)
-            if (acceptStatus === 'not_accepted') {
-              toAccept.add(taskCode)
-            }
-          }
-        } else if (acceptStatus === 'not_accepted') {
+      if (includeInProgress) {
+        if (
+          acceptStatus === 'not_accepted' ||
+          acceptStatus === 'in_progress' ||
+          acceptStatus === 'accepted'
+        ) {
           pending.push(taskCode)
+          if (acceptStatus === 'not_accepted') {
+            toAccept.add(taskCode)
+          }
         }
-        continue
-      }
-      // 等级族：无 accept_status、无 progress，判据是服务端记录的真实活动。
-      // `status` 非 available 即视为已达成（不再重复做）。
-      const status = readString(task, 'status')
-      progressByCode[taskCode] = { current: status === 'available' ? 0 : 1, target: 1 }
-      if (status === 'available') {
+      } else if (acceptStatus === 'not_accepted') {
         pending.push(taskCode)
       }
+      continue
+    }
+    // 等级族：无 accept_status、无 progress，判据是服务端记录的真实活动。
+    // `status` 非 available 即视为已达成（不再重复做）。
+    const status = readString(task, 'status')
+    progressByCode[taskCode] = { current: status === 'available' ? 0 : 1, target: 1 }
+    if (status === 'available') {
+      pending.push(taskCode)
     }
   }
   if (!anyOk) {
@@ -1135,6 +1207,21 @@ export const GROWTH_TASK_COMPLETION: Record<string, GrowthTaskSpec> = {
     label: '完成技能安装（等级任务，判据 skill_info）',
   },
   wechat_linked: { kind: 'chat', label: '链接微信（等级任务，需客户端）' },
+  // ── 小程序口径专属任务（`X-Client-Platform: miniprogram` 才下发）──
+  // 判据载体与 web 侧**完全不同**：mp 指纹的 `chat_request_send` / `expert_actual_use`，
+  // 见 `MP_TASK_CODES` 的实测表与各 case 的注释。
+  school_season: { kind: 'mpChat', label: '校园日（mp 对话 + activityId）', withActivityId: true },
+  Sequential_Tasks_1: { kind: 'mpChat', label: '小程序内完成 1 次对话' },
+  Sequential_Tasks_2: { kind: 'mpExpert', label: '小程序内选中专家并完成对话' },
+  Sequential_Tasks_3: { kind: 'mpChat', label: '小程序内完成 5 次对话' },
+  Sequential_Tasks_4: { kind: 'mpEvent', label: '小程序内创建定时任务（判据未完全逆向）' },
+  Sequential_Tasks_5: {
+    kind: 'mpChat',
+    label: '小程序内使用 GLM5.2',
+    model: { id: GLM_MODEL_ID, name: GLM_MODEL_NAME },
+  },
+  Sequential_Tasks_6: { kind: 'mpChat', label: '小程序内完成 10 次对话' },
+  Sequential_Tasks_7: { kind: 'mpEvent', label: '小程序内体验灵感功能（判据未完全逆向）' },
 }
 
 /** 桌面事件上报的字段顺序（照 WorkBuddy 桌面端 `DesktopChatSequence`）。 */
@@ -1786,6 +1873,246 @@ async function reportTaskEvents(
   return { ok: true, reported, message: `已上报 ${reported} 条事件` }
 }
 
+/**
+ * 上报**一条**对话活跃事件（`chat_request_send`）到桌面域 `/v2/report`。
+ *
+ * ## 为什么需要它（而不是复用 `reportTaskEvents`）
+ *
+ * 领养首只 Buddy 有一个硬前置：**当日必须先有活跃上报**，否则
+ * `/activity/growth/buddy/first` 恒回 HTTP 400
+ * `first_buddy task not completed yet`（参考实现 `internal/scheduler/travel.go`
+ * 的 `travelAdopt` 把「先 report 再 first」写成了显式链路，并实测 1.05s 间隔）。
+ *
+ * `reportTaskEvents` 是「按任务码上报一整串判据事件」，会引入该任务特有的字段；
+ * 这里要的是**最小、通用的一条 `chat_request_send`**，与 `black_cat` / `chat_5`
+ * 的补量上报同形，故单独抽一个入口，供 `buddy-growth-center.ts` 的领养流程注入。
+ *
+ * ⚠️ 服务端**不校验** conversationId 的真实性（参考实现实测），故这里直接生成。
+ */
+export async function reportGrowthActivity(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<{ ok: boolean; message: string }> {
+  const conversationId = newConversationId()
+  const event = chatRequestSendEvent(DEFAULT_CHAT_MODEL, DEFAULT_CHAT_MODEL, conversationId)
+  const result = await reportDesktopEvents(
+    credential,
+    product,
+    fetcher,
+    [event],
+    conversationId,
+    conversationId,
+  )
+  return { ok: result.ok, message: result.ok ? '已上报一条活跃记录' : result.message }
+}
+
+/**
+ * 小程序口径（`X-Client-Platform: miniprogram`）专属下发的成长任务码。
+ *
+ * ## 实测证据（2026-10-23，本机真实账号只读探针）
+ *
+ * `scripts/probe-buddy-growth.mjs` 在同一个账号上分别拉两种口径的列表：
+ *
+ * | 口径 | 条数 | 任务码 |
+ * |---|---|---|
+ * | web `/v2/...` | 16 | create_canvas, playbook_prompt, RichMeow_Chat, Library_read, Expert_lighthouse, Hp_Appearance, Buddy_App, wb_wechat_oa_subscribe_task, WorkBuddy_Valorant, Expert_team_use_3, first_buddy, chat_5, skill_1, expert_5, template_5, automation_1 |
+ * | mp `/v2/...` | 9 | RichMeow_Chat, wb_wechat_oa_subscribe_task, WorkBuddy_Valorant, **Sequential_Tasks_1**, **Sequential_Tasks_2**, Expert_team_use_3, first_buddy, chat_5, automation_1 |
+ *
+ * ⚠️⚠️ **参考实现说「mp 列表是默认口径的超集」，本机实测是假** —— mp 口径**漏掉**
+ * 了 create_canvas / playbook_prompt / Library_read / Expert_lighthouse /
+ * Hp_Appearance / Buddy_App / skill_1 / expert_5 / template_5 九项。故两边必须
+ * **取并集**（按 task_code 去重），只认任一侧都会静默丢任务：
+ * 只认 web ⇒ `Sequential_Tasks_*` 永远进不了待办；只认 mp ⇒ 九项常规任务消失。
+ *
+ * `Sequential_Tasks_1..7` 是**链式解锁**（每日零点放开一环，前置未完成时 accept
+ * 回 `prerequisite not met`），故本集合含 8 项（`school_season` 是活动期任务，
+ * 活动结束后列表里就不会出现，代码留着不碍事）。
+ */
+export const MP_TASK_CODES: ReadonlySet<string> = new Set([
+  'school_season',
+  'Sequential_Tasks_1',
+  'Sequential_Tasks_2',
+  'Sequential_Tasks_3',
+  'Sequential_Tasks_4',
+  'Sequential_Tasks_5',
+  'Sequential_Tasks_6',
+  'Sequential_Tasks_7',
+])
+
+/**
+ * 小程序对话事件的间隔（毫秒）。
+ *
+ * ⚠️ **这是判据参数，不是节流**：上游对「小程序内完成 N 次有效对话」有反作弊校验，
+ * 数秒级连发会被判无效并**整体回滚**（参考实现实测 2026-09-26：2s 连发 4 条全灭，
+ * 45s 间隔逐条上报全存活）。故默认 45s，且**首条也等**（上一轮被回滚后立刻重报同样无效）。
+ *
+ * 代价：`Sequential_Tasks_3`（5 次）≈ 4 分钟/账号，`Sequential_Tasks_6`（10 次）≈ 8 分钟
+ * —— 由 `budgetMs`（缺省 10 分钟）兜住，预算耗尽会如实标 timedOut 让用户再点一次。
+ */
+export const MP_CHAT_EVENT_GAP_MS = 45_000
+
+/** 小程序上报域：`www.codebuddy.cn`（参考实现 `BillingBaseCN`，与 billing 同域）。 */
+const MP_REPORT_ORIGIN = 'https://www.codebuddy.cn'
+
+/** 校园日 / 开学季的活动 id（`school_season` 的判据事件必须带）。 */
+const SCHOOL_ACTIVITY_ID = 'school_open_day_2026'
+
+/**
+ * 小程序埋点公共指纹（对齐小程序 `appservice` 的 `wQ()`+`Ao()`）。
+ *
+ * ⚠️ `machineId` 是**常量**而非本机派生：小程序侧该值来自微信运行环境，参考实现
+ * 实测用固定值可稳定计数；此处照抄，别"优化"成 sha256（那会变成一个未验证的变量）。
+ */
+function mpEventBase(credential: BuddyCredential): Record<string, unknown> {
+  return {
+    timestamp: Date.now(),
+    ideType: 'WorkBuddy_MP',
+    ideVersion: '2.4.0',
+    extName: 'workbuddy-mp',
+    extVersion: '2.4.0',
+    product: 'SaaS',
+    ideName: 'wx_app_cloud',
+    platform: 'mini_program',
+    os: 'windows',
+    osVersion: '11',
+    arch: 'x64',
+    machineId: '0655736a-607f-4d9d-b430-58176ee9a090',
+    timezone: 'Asia/Shanghai',
+    userId: credential.user_id ?? '',
+    userNickname: '',
+  }
+}
+
+/** 小程序口径的一条 `chat_request_send`（`Sequential_Tasks_1/3/6` 的判据载体）。 */
+function mpChatEvent(conversationId: string): GrowthEvent {
+  const requestId = `wb2api-mp-${conversationId.slice(-8)}`
+  return {
+    eventCode: 'chat_request_send',
+    inputLength: 14, isPlan: false, isAutoExecuteTerminal: false,
+    isAutoModify: false, codebaseEnable: false, maxToken: 0,
+    maxSteps: 500, temperature: 0, maxRetries: 0,
+    mentionContexts: [], knowledgeId: [], knowledgeName: [],
+    codebaseId: '', mentionContextCount: 0, command: '',
+    recommendId: '', skillId: '', skillCount: 0, totalCount: 0,
+    traceId: requestId, rootRequestId: requestId,
+    parentConversationId: conversationId, conversationId,
+    messageId: `msg-${requestId.slice(-8)}`,
+    agentName: 'mp', agentType: 'main',
+    'codebuddy.session_id': conversationId,
+    'codebuddy.conversation_request_id': requestId,
+  }
+}
+
+/** 小程序口径的 `expert_actual_use`（`Sequential_Tasks_2` 的判据载体）。 */
+function mpExpertUseEvent(expertId: string, expertName: string, expertType: string): GrowthEvent {
+  return {
+    eventCode: 'expert_actual_use',
+    reportDelay: 0,
+    // ⚠️ 事件自带 `extVersion: 2.2.8`：真实小程序事件就是这个版本号，覆盖公共指纹。
+    extVersion: '2.2.8',
+    source: 'mini_program',
+    id: expertId,
+    name: expertId,
+    expertTitle: expertName.length > 0 ? expertName : expertId,
+    type: 'send_message',
+    characterCount: 12,
+    expertType: expertType.length > 0 ? expertType : 'agent',
+  }
+}
+
+/** 小程序口径的灵感事件组（`Sequential_Tasks_7` 的尝试载体）。 */
+function mpPlaybookEvents(caseId: string): GrowthEvent[] {
+  const base = { id: caseId, name: caseId, type: 'document', categoryId: '', categoryName: '', skills: '', skillNames: '' }
+  return [
+    { ...base, eventCode: 'playbook_cta_click', source: 'discover', position: 1, extVersion: '2.2.8' },
+    {
+      ...base,
+      eventCode: 'playbook_prompt_send', source: 'discover', promptLength: 96, isOfficial: 1,
+      conversationId: `wb2api-mp-pb-${newConversationId()}`, extVersion: '2.2.8',
+    },
+  ]
+}
+
+/**
+ * 以**小程序指纹**向 `www.codebuddy.cn/v2/report` 批量上报事件。
+ *
+ * ⚠️ 与 {@link reportDesktopEvents}（桌面指纹 + `product.endpoint`）、
+ * `reportWebEvent`（web 指纹 + `webBase`）并列为**第三条上报腿**，三者不可互换：
+ * 判据按 `source` / `platform` 归属，串了就静默不计数。
+ */
+async function reportMpEvents(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch,
+  eventList: GrowthEvent[],
+): Promise<ReportResult> {
+  if (eventList.length === 0) return { ok: false, reported: 0, message: 'mp 上报：没有事件' }
+  const base = mpEventBase(credential)
+  const body = eventList.map((event) => ({ ...base, ...event }))
+  try {
+    const response = await fetcher(`${MP_REPORT_ORIGIN}/v2/report`, {
+      method: 'POST',
+      redirect: 'error',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${credential.access_token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Client-Product': 'workbuddy-mp',
+        'X-Client-Version': '2.4.0',
+        'X-Client-Platform': 'mp-weixin',
+        'X-Platform': 'wechatmp',
+        ...credential.user_id === undefined || credential.user_id.length === 0
+          ? {}
+          : { 'X-User-Id': credential.user_id },
+        'User-Agent': product.userAgent,
+      },
+      body: JSON.stringify(body),
+    })
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, reported: 0, message: `凭据已失效（HTTP ${response.status}）` }
+    }
+    if (!response.ok) {
+      return { ok: false, reported: 0, message: `mp 事件上报失败（HTTP ${response.status}）` }
+    }
+    return { ok: true, reported: body.length, message: `已上报 ${body.length} 条 mp 事件` }
+  } catch (error) {
+    return {
+      ok: false,
+      reported: 0,
+      message: `mp 事件上报失败：${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+}
+
+/**
+ * 拉取**小程序口径**的任务列表（两个候选路径都试，取并集）。
+ *
+ * ⚠️ 失败**不是错误**：活动期结束 / 账号无 mp 任务时该口径可能整片为空。故返回
+ * 空数组而不抛错，由调用方与 web 口径取并集（见 {@link fetchGrowthTaskCodes}）。
+ */
+export async function fetchMpTaskItems(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch,
+): Promise<GrowthTaskItem[]> {
+  const out: GrowthTaskItem[] = []
+  const seen = new Set<string>()
+  for (const path of GROWTH_TASKS_PATHS) {
+    const result = await getGrowthJson(path, credential, product, fetcher, MP_PLATFORM)
+    if (!result.ok || result.body.code !== 0) continue
+    for (const task of tasksOf(result)) {
+      if (typeof task !== 'object' || task === null) continue
+      const code = readString(task, 'task_code') || readString(task, 'code')
+      if (code.length === 0 || seen.has(code)) continue
+      seen.add(code)
+      out.push(task)
+    }
+  }
+  return out
+}
+
 /** 拉取专家市场真实专家列表（`POST /portal/operation-platform/market/expert/list`）。
  * `expert_5` / `Expert_team_use_3` 的完成判据要求 `expert_id` 是平台**真实**专家
  * （编造 id 不计数），故完成动作前必须先取真 id。
@@ -1912,6 +2239,12 @@ async function listAllGrowthTaskCodes(
       }
     }
   }
+  // 小程序口径也必须进扫尾：`Sequential_Tasks_*` 只在 mp 列表里下发，漏掉这层
+  // 就等于「做了任务但永远不会自动领奖」。
+  for (const task of await fetchMpTaskItems(credential, product, fetcher)) {
+    const code = readString(task, 'task_code') || readString(task, 'code')
+    if (code.length > 0) codes.add(code)
+  }
   return [...codes]
 }
 
@@ -1925,12 +2258,65 @@ async function listAllGrowthTaskCodes(
  * `task not completed`）。响应体 `{ code:0, data:{ already_claimed, credit, energy } }`。
  * 重复领取返回 `already_claimed:true`（幂等终态，不报错）。
  */
+/**
+ * 以**小程序口径**领取单个任务奖励。
+ *
+ * 返回 `undefined` = **请调用方降级到 web 域**（chat 域对该码回 400，属正常形态，
+ * 不是失败 —— 参考实现 `ClaimRewardMP` 就带这条降级）。
+ *
+ * 响应形状与 web 领取一致：`{code:0, data:{already_claimed, credit, energy}}`。
+ */
+async function claimMpTaskReward(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  fetcher: typeof fetch,
+  taskCode: string,
+): Promise<ClaimResult | undefined> {
+  const result = await postGrowthJson(
+    `${GROWTH_TASK_CLAIM_PREFIX}${encodeURIComponent(taskCode)}/claim`,
+    credential,
+    product,
+    {},
+    fetcher,
+    MP_PLATFORM,
+  )
+  if (!result.ok) {
+    return { ok: false, claimed: false, credit: 0, message: result.message }
+  }
+  const code = typeof result.body.code === 'number' ? result.body.code : -1
+  if (code === 400) return undefined // 交给 web 域兜底
+  const classified = classifyGrowthWrite(result)
+  if (classified.state === 'success') {
+    if (classified.data['already_claimed'] === true) {
+      return { ok: true, claimed: false, credit: 0, message: `${taskCode} 已领取过（幂等）` }
+    }
+    const credit = readNumber(classified.data, 'credit')
+    return {
+      ok: true,
+      claimed: true,
+      credit,
+      message: credit > 0 ? `${taskCode} 领取到 ${credit} 积分` : `${taskCode} 已领取`,
+    }
+  }
+  if (classified.state === 'no-object') {
+    return { ok: true, claimed: false, credit: 0, message: classified.message }
+  }
+  return { ok: false, claimed: false, credit: 0, message: classified.message }
+}
+
 export async function claimGrowthTaskReward(
   credential: BuddyCredential,
   product: BuddyProduct,
   fetcher: typeof fetch = fetch,
   taskCode: string,
 ): Promise<ClaimResult> {
+  // 小程序专属任务必须走**小程序口径**的领奖端点（chat 域 + mp 头）：缺头上游回
+  // `task not found`（参考实现实测）。chat 域回 400 时降级 web 域（部分任务/租户
+  // 形态如此）——`claimMpTaskReward` 返回 `undefined` 表示「请走 web 兜底」。
+  if (MP_TASK_CODES.has(taskCode)) {
+    const viaMp = await claimMpTaskReward(credential, product, fetcher, taskCode)
+    if (viaMp !== undefined) return viaMp
+  }
   // ⚠️ 必须在发请求前判空：空基址会拼出 `undefined/...` 或 `/activity/...`（相对路径），
   // 两者都能「发出去」，失败现象却指向服务端 —— 真因是本插件缺配置。
   const claimBase = claimBaseOf(product)
@@ -2376,12 +2762,28 @@ export async function runGrowthTaskCompletions(
   const toAccept = unfinished.toAccept
     ? actionable.filter((code) => unfinished.toAccept?.has(code))
     : actionable
-  const acceptResult = toAccept.length
+  /**
+   * ⚠️ **web 与 mp 两批必须分开提交**（`X-Client-Platform` 不同）：混在一批里会让
+   * 上游对 mp 任务回 `task not found`（参考实现 `tasksweep.go` 把两批拆开提交）。
+   */
+  if (toAccept.length > 0) options.onStep?.('接取任务')
+  const toAcceptWeb = toAccept.filter((code) => !MP_TASK_CODES.has(code))
+  const toAcceptMp = toAccept.filter((code) => MP_TASK_CODES.has(code))
+  const emptyAccept = { ok: true, status: 200, body: { code: 0 } } satisfies GrowthCallResult
+  const acceptWeb = toAcceptWeb.length
     ? await postGrowthJson(
-        GROWTH_TASK_ACCEPT_PATH, credential, product, { task_codes: toAccept }, fetcher,
+        GROWTH_TASK_ACCEPT_PATH, credential, product, { task_codes: toAcceptWeb }, fetcher,
       )
-    : ({ ok: true, status: 200, body: { code: 0 } } satisfies GrowthCallResult)
-  const accept = classifyGrowthWrite(acceptResult)
+    : emptyAccept
+  const acceptMp = toAcceptMp.length
+    ? await postGrowthJson(
+        GROWTH_TASK_ACCEPT_PATH, credential, product, { task_codes: toAcceptMp }, fetcher,
+        MP_PLATFORM,
+      )
+    : emptyAccept
+  const acceptWebResult = classifyGrowthWrite(acceptWeb)
+  const acceptMpResult = classifyGrowthWrite(acceptMp)
+  const accept = acceptWebResult.state === 'failed' ? acceptWebResult : acceptMpResult
   // 接取失败：逐项记为失败，但**仍继续走扫尾** —— 接取失败只影响「本轮新接的
   // 任务」，账号里已达标未领取的奖励与接取无关，不该被它连带跳过。
   // （早期实现此处直接 return，于是接取一失败就整轮不领奖。）
@@ -2463,6 +2865,8 @@ export async function runGrowthTaskCompletions(
       continue
     }
     try {
+      // 状态行：这一项叫什么（`label` 是给用户看的中文名，不是任务码）。
+      options.onStep?.(`任务 ${code}：${spec.label}`)
       switch (spec.kind) {
         case 'canvas':
         case 'canvasThenChat': {
@@ -2767,6 +3171,114 @@ export async function runGrowthTaskCompletions(
           }
           break
         }
+        /**
+         * 小程序口径对话任务（`school_season` / `Sequential_Tasks_1/3/5/6`）：
+         * 判据是 **mp 指纹**的 `chat_request_send`，按 `target - current` 补量。
+         *
+         * ⚠️⚠️ **两条实测纪律**（都来自参考实现对真实账号的实测，别"优化"掉）：
+         * 1. **事件间隔 ≈45s**：数秒级连发会被反作弊判定无效并**整体回滚**
+         *    （2s 连发 4 条全灭；45s 间隔逐条上报全存活）。故首条也等。
+         * 2. **accept 后必须回读 target**：接受前 `target` 下发 0，按兜底 1 报会
+         *    少报（Tasks_6 真实 target=10，只补 1 条就误判达标去领奖 ⇒ 400）。
+         *    本函数的 `progressByCode` 来自 accept 之后的同一轮列表，已含真实 target。
+         */
+        case 'mpChat': {
+          const gap = Math.max(0, options.mpChatEventGapMs ?? MP_CHAT_EVENT_GAP_MS)
+          // 抖动只在真跑时加（间隔为 0 的单测不加，否则用例会真的 sleep）。
+          const jitter = gap > 0 ? Math.floor(Math.random() * Math.min(10_000, gap)) : 0
+          const initial = progressByCode[code] ?? { current: 0, target: 1 }
+          const target = initial.target > 0 ? initial.target : 1
+          let sent = 0
+          const need = Math.max(0, target - initial.current)
+          for (let round = 0; round < need; round += 1) {
+            if (gap + jitter > 0) {
+              await new Promise((resolve) => setTimeout(resolve, gap + jitter))
+            }
+            if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+              timedOut = true
+              message = `mp 对话事件已上报 ${sent}/${need} 条，时间预算用尽（再点一次继续）`
+              break
+            }
+            const conversationId = `wb2api-mp-${String(Date.now())}-${String(round)}`
+            const base = mpChatEvent(conversationId)
+            const event: GrowthEvent = spec.withActivityId === true
+              ? { ...base, activityId: SCHOOL_ACTIVITY_ID }
+              : spec.model !== undefined
+                ? { ...base, requestModelId: spec.model.id, requestModelName: spec.model.name }
+                : base
+            const reported = await reportMpEvents(credential, product, fetcher, [event])
+            if (!reported.ok) {
+              message = `第 ${String(sent + 1)} 条 mp 事件上报失败：${reported.message}`
+              break
+            }
+            sent += 1
+          }
+          if (message.length === 0) {
+            // 异步计分：有界回读（3s × 2），不无限等
+            let progress = { current: initial.current, target }
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 3_000))
+              progress = await readProgress(credential, product, fetcher, code)
+              if (progress.current >= progress.target) break
+            }
+            if (progress.current >= progress.target) {
+              ok = true
+              const claim = await claimGrowthTaskReward(credential, product, fetcher, code)
+              message = `已上报 ${String(sent)} 条 mp 对话事件，progress 达标（${String(progress.current)}/${String(progress.target)}）；${claim.message}`
+            } else {
+              // ⚠️ **不谎报完成**：异步计分未归账就是没做到，如实计失败并说明可重试。
+              message = `已上报 ${String(sent)} 条 mp 对话事件，progress ${String(progress.current)}/${String(progress.target)} 未达标（异步计分未归账，下次点一次继续）`
+            }
+          }
+          break
+        }
+        /** `Sequential_Tasks_2`（小程序内选中专家完成对话）：判据 = mp 指纹 `expert_actual_use`。 */
+        case 'mpExpert': {
+          const expert = expertAgentList[0]
+          if (expert === undefined) {
+            message = '专家市场未返回可用专家（expert_id 必须是真实 id，编造不计数）'
+            break
+          }
+          const reported = await reportMpEvents(credential, product, fetcher, [
+            mpExpertUseEvent(expert.expertId, expert.name ?? expert.title ?? '', expert.expertType ?? 'agent'),
+          ])
+          if (!reported.ok) {
+            message = reported.message
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+          const progress = await readProgress(credential, product, fetcher, code)
+          if (progress.current >= progress.target) {
+            ok = true
+            const claim = await claimGrowthTaskReward(credential, product, fetcher, code)
+            message = `已上报 mp 专家对话（${expert.expertId}），progress 达标；${claim.message}`
+          } else {
+            message = `已上报 mp 专家对话（${expert.expertId}），progress ${String(progress.current)}/${String(progress.target)} 未达标（判据未完全逆向，下次重试）`
+          }
+          break
+        }
+        /**
+         * 小程序口径的预留任务（`Sequential_Tasks_4/7`）：判据未完全逆向，先复用
+         * **PC 侧**同一批事件组尝试点亮（`automation_1` / `playbook_prompt` 同源），
+         * 点亮即领奖；点不亮如实报「未涨」，不谎报成功。
+         */
+        case 'mpEvent': {
+          const reported = await reportTaskEvents(credential, product, fetcher, code, 1, {})
+          if (!reported.ok) {
+            message = reported.message
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, SETTLE_WAIT_MS))
+          const progress = await readProgress(credential, product, fetcher, code)
+          if (progress.current >= progress.target) {
+            ok = true
+            const claim = await claimGrowthTaskReward(credential, product, fetcher, code)
+            message = `${reported.message}，progress 达标（${String(progress.current)}/${String(progress.target)}）；${claim.message}`
+          } else {
+            message = `${reported.message}，progress ${String(progress.current)}/${String(progress.target)} 未涨（mp 判据未完全逆向，下次重试）`
+          }
+          break
+        }
       }
     } catch (error) {
       /**
@@ -2822,6 +3334,9 @@ export async function runGrowthTaskCompletions(
         failed += 1
         break
       }
+      // 状态行：扫尾阶段逐项报（`补领 <code>`），与上面的「任务 <code>：<label>」区分开
+      // —— 用户在等的时候能看出「现在是在做任务，还是在把已达标的一批领掉」。
+      options.onStep?.(`补领 ${code}`)
       const claim = await claimGrowthTaskReward(credential, product, fetcher, code)
       if (claim.ok && claim.claimed) {
         claimedCount += 1
@@ -2882,6 +3397,13 @@ export async function collectBuddyGrowth(
   entry: ProviderAccountEntry,
   budgetMs: number | undefined,
   roundDeadlineAt: number | undefined,
+  /**
+   * 进度回调（可选）：一路透传给 unGrowthTaskCompletions 的 onStep。
+   *
+   * 存在的理由：一键领取是**一次 RPC 跑几分钟**，面板只能靠宿主侧进度表
+   * （src/growth-progress.ts）来显示「这个号现在在做什么」。
+   */
+  onStep?: (step: string) => void,
 ): Promise<RpcBuddyGrowthAccountResult> {
   // 整轮预算已耗尽 ⇒ 该账号**不再发起任何成长请求**。
   //
@@ -2898,7 +3420,10 @@ export async function collectBuddyGrowth(
   }
   let report: Awaited<ReturnType<typeof runGrowthTaskCompletions>>
   try {
-    report = await runGrowthTaskCompletions(credential, product, fetch, { budgetMs })
+    report = await runGrowthTaskCompletions(credential, product, fetch, {
+      budgetMs,
+      ...onStep === undefined ? {} : { onStep },
+    })
   } catch (error) {
     return {
       accountId: entry.id, nickname: entry.nickname,

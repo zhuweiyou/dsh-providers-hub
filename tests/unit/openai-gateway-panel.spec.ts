@@ -10,7 +10,12 @@ import {
   gatewayButtonTitle,
   gatewayCardExpanded,
   gatewayCardLabel,
+  gatewayBindLabel,
   gatewayEndpoint,
+  gatewayLanOverrideHint,
+  gatewayLanSwitchHint,
+  gatewayLanToggleNotice,
+  gatewayLanUrls,
   gatewayLoopbackOnly,
   gatewayFootnote,
   nonLoopbackNotice,
@@ -1177,12 +1182,19 @@ describe('网关弹窗的胶囊不截断（用户报障 2026-10-04）', () => {
     const panel = source.slice(source.indexOf('function GatewayPanel('))
     // ① 开关行那个 code（用户 2026-10-04 要求把客户端列举删掉，只剩这一句；
     //    issue IKL7UN 之后地址改为取自真实 host，句式不变）
-    expect(panel).toMatch(/`在 \$\{status\.address\.host\} 监听，供客户端调用`/)
+    //    ⚠️ 2026-10-23 加「允许局域网访问」后，host 可能是通配地址 `0.0.0.0` ——
+    //       直接印出来会让人以为客户端要填 0.0.0.0，故改走 `gatewayBindLabel`
+    //       （「在所有网卡监听」）。句式仍是「在 X 监听，供客户端调用」。
+    expect(panel).toContain('${gatewayBindLabel(status)}，供客户端调用')
     // ② 卡片行内的模型 ID（在 GatewayModelRow 里，同一个文件）
     expect(source).toContain('gatewayModelKeyOf(model)')
     // ③ API KEY 明文那块也用它（显示明文时，祖先只有 gatewayKeyRow）
     expect(panel).toContain("className: 'dim-jh-gatewayKeyRow'")
     expect(panel).toMatch(/apiKey\.value/)
+    // ④ 局域网开关行（`仅本机 127.0.0.1` / `已在全部网卡监听`）与 ⑤ 局域网地址列表：
+    //    2026-10-23 新增的两个渲染点，祖先链同样各不相同 ⇒ 两级通配**仍然必需**。
+    expect(panel).toContain("'已在全部网卡监听'")
+    expect(panel).toContain('gatewayLanUrls(status).map(')
     // ⚠️ 两处 curl 代码块**已被用户要求删除**（它们曾是这条判据的第 4/5 个渲染点）。
     //    删掉之后 `.dim-jh-modelId` 在弹窗里仍有 3 个位置、祖先链各不相同 ——
     //    故两级通配**仍然必需**，这条判据没有因为删 curl 而失效。
@@ -1290,9 +1302,11 @@ describe('网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / �
     // ⚠️ 用户 2026-10-04 定下的**句式**保留（「在 X 监听，供客户端调用」）。
     // ✅ issue IKL7UN 之后 X 必须来自 `status.address.host`：写死 127.0.0.1 会让
     // 容器部署的用户照着抄一个从容器外连不上的地址 —— 正是该 issue 的症状。
-    expect(panel).toMatch(/`在 \$\{status\.address\.host\} 监听，供客户端调用`/)
+    // ⚠️ 2026-10-23 起 X 走 `gatewayBindLabel(status)`：通配地址（局域网开关打开）
+    // 必须翻成「在所有网卡监听」，否则用户会以为客户端要填 0.0.0.0。
+    expect(panel).toContain('${gatewayBindLabel(status)}，供客户端调用')
     // 未在监听时退回定性说法，**不得**编造具体地址（与 gatewayEndpoint 的取舍同源）。
-    expect(panel).toContain("'在本机监听，供客户端调用'")
+    expect(panel).toContain("'只在本机监听，供客户端调用'")
     // ⚠️ 硬编码 127.0.0.1 的胶囊**必须消失**（剥注释后判，注释里会引用旧写法）。
     expect(code(panel)).not.toContain('在 127.0.0.1 监听，供客户端调用')
     // ⚠️ 客户端列举必须删掉 —— 它是窄面板下折行、且把「打开/关闭」动作词挤远的成因。
@@ -1333,10 +1347,13 @@ describe('网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / �
     expect(stripped).not.toContain('地址栏直接打开会 401')
   })
 
-  it('④ 三段各有一个 .dim-jh-gatewaySection 容器，且段间有分隔', () => {
-    // 结构：三个段容器（开关+连接信息 / 模型 ID / 思考档位对照表）。
-    expect((panel.match(/className: 'dim-jh-gatewaySection'/g) || []).length, '应恰好三段')
-      .toBe(3)
+  it('④ 四段各有一个 .dim-jh-gatewaySection 容器，且段间有分隔', () => {
+    // 结构：四个段容器（开关+连接信息 / **局域网访问** / 模型 ID / 思考档位对照表）。
+    // ⚠️ 2026-10-23 从三段变四段：用户要求加「允许局域网访问」开关，它必须**独立成段**
+    //    —— 塞进第一段会让「跑不跑」与「谁能连」两个开关挤在同一块里，最容易误拨。
+    //    段间分隔的判据（相邻兄弟选择器）随之覆盖到新的一段。
+    expect((panel.match(/className: 'dim-jh-gatewaySection'/g) || []).length, '应恰好四段')
+      .toBe(4)
     // 段标题只有后两段有（第一段以开关行为锚，无需标题）。
     expect((panel.match(/className: 'dim-jh-gatewaySectionTitle'/g) || []).length).toBe(2)
     // ⚠️ 分隔靠 `A + B` **相邻兄弟**选择器：写成 `.dim-jh-gatewaySection` 通配
@@ -1437,5 +1454,104 @@ describe('供应商卡片的折叠', () => {
   it('脏输入退化为展开（宁可多显示，也不要藏起来）', () => {
     expect(gatewayCardExpanded(null)).toBe(true)
     expect(gatewayCardExpanded({})).toBe(true)
+  })
+})
+
+/**
+ * 「允许局域网访问」开关的**面板文案与判据**（2026-10-23）。
+ *
+ * 用户诉求原文：「画面和逻辑都只绑定了 127.0.0.1，希望加个开关支持局域网调用，
+ * 默认不开启，就是用户切换开关可以切换局域网网关是否开启，包括画面上说只允许
+ * 127 的相关文案也要调整了」。
+ *
+ * ⇒ 本组锁三件事：
+ * 1. 通配地址**不能**被当成客户端可填的地址印出来（`http://0.0.0.0` 连不上）；
+ * 2. 开关文案要**说清后果**（谁能连、隔离只靠 Key）；
+ * 3. env 覆盖了开关时必须**明说**（否则用户以为开关坏了）。
+ */
+describe('允许局域网访问：地址与文案', () => {
+  const wildcardStatus = (patch = {}) => ({
+    enabled: true,
+    running: true,
+    blockedByEnv: false,
+    address: { host: '0.0.0.0', port: 8326 },
+    lanAccess: true,
+    lanUrls: ['http://192.168.1.8:8326/v1'],
+    apiKey: null,
+    models: [],
+    modelsSource: 'none',
+    ...patch,
+  })
+
+  it('⚠️ 绑通配地址时 gatewayEndpoint 回 127.0.0.1（0.0.0.0 抄进客户端连不上）', () => {
+    expect(gatewayEndpoint(wildcardStatus())).toBe('http://127.0.0.1:8326/v1')
+  })
+
+  it('局域网地址单独给，且滤掉脏项', () => {
+    expect(gatewayLanUrls(wildcardStatus())).toEqual(['http://192.168.1.8:8326/v1'])
+    expect(gatewayLanUrls(wildcardStatus({ lanUrls: ['', null, 'http://10.0.0.5:8326/v1'] })))
+      .toEqual(['http://10.0.0.5:8326/v1'])
+    expect(gatewayLanUrls(null)).toEqual([])
+  })
+
+  it('监听标签把 0.0.0.0 翻成人话；具体地址原样显示', () => {
+    expect(gatewayBindLabel(wildcardStatus())).toBe('在所有网卡监听')
+    expect(gatewayBindLabel(wildcardStatus({ address: { host: '172.21.0.8', port: 8326 } })))
+      .toBe('在 172.21.0.8 监听')
+    expect(gatewayBindLabel(null)).toBe('')
+  })
+
+  it('关闭态文案点明「只有这台机器能调用」+ 打开后的后果', () => {
+    const hint = gatewayLanSwitchHint(wildcardStatus({ lanAccess: false, lanUrls: [] }))
+    expect(hint).toContain('127.0.0.1')
+    expect(hint).toContain('同一网络内')
+    expect(hint).toContain('API Key')
+    // ⚠️ 纯文本，不得出现 markdown 星号（会原样显示）
+    expect(hint).not.toContain('**')
+  })
+
+  it('开启态文案：有地址时指向下面的地址；没地址时说「未检测到」', () => {
+    expect(gatewayLanSwitchHint(wildcardStatus())).toContain('下面的地址')
+    expect(gatewayLanSwitchHint(wildcardStatus({ lanUrls: [] }))).toContain('未检测到')
+    expect(gatewayLanSwitchHint(wildcardStatus({ running: false }))).toContain('未在监听')
+  })
+
+  it('被 env 停用时，开关文案也说清「开了也不生效」', () => {
+    expect(gatewayLanSwitchHint(wildcardStatus({ blockedByEnv: true }))).toContain('DSH_OPENAI_GATEWAY_ENABLED')
+  })
+
+  it('env 覆盖了开关 ⇒ 必须明说，否则用户以为开关坏了', () => {
+    const overridden = wildcardStatus({ address: { host: '172.21.0.8', port: 8326 }, lanUrls: [] })
+    const hint = gatewayLanOverrideHint(overridden)
+    expect(hint).toContain('172.21.0.8')
+    expect(hint).toContain('优先')
+    // 没开 / 没被覆盖时不出提示（避免噪声）
+    expect(gatewayLanOverrideHint(wildcardStatus())).toBe('')
+    expect(gatewayLanOverrideHint(wildcardStatus({ lanAccess: false }))).toBe('')
+  })
+
+  it('切换提示：开 ⇒ **不印具体地址**（指向上方列表）；关 ⇒ 明确回到回环', () => {
+    // ⚠️ 2026-10-23 用户明确要求：提示条里不要指定某个地址 —— 上方列表已经有
+    // 全部可用地址，再挑一个印出来会让用户只看到那一个（多网卡时容易挑到 VPN/TUN
+    // 地址，实测见过 198.18.0.1，照它配就连不通）。
+    const opened = gatewayLanToggleNotice({ running: true, lanUrls: ['http://192.168.1.8:8326/v1'] }, true)
+    expect(opened).not.toContain('192.168.1.8')
+    expect(opened).not.toContain('http://')
+    expect(opened).toContain('上方列表')
+    // 「未检测到地址」仍是信息，必须说（这一格打印的不是地址本身）
+    expect(gatewayLanToggleNotice({ running: true, lanUrls: [] }, true)).toContain('未检测到')
+    expect(gatewayLanToggleNotice({ running: false, lanUrls: [] }, true)).toContain('没有在监听')
+    expect(gatewayLanToggleNotice({ running: true, lanUrls: [] }, false)).toContain('127.0.0.1')
+  })
+
+  it('页头 tooltip 要带出「局域网可访问」', () => {
+    expect(gatewayButtonTitle(wildcardStatus())).toContain('局域网可访问')
+    expect(gatewayButtonTitle(wildcardStatus({ lanAccess: false }))).not.toContain('局域网可访问')
+  })
+
+  it('非回环提示给出「关掉开关」这条更简单的手动路径', () => {
+    expect(nonLoopbackNotice(wildcardStatus({ address: { host: '0.0.0.0', port: 8326 } })))
+      .toContain('允许局域网访问')
+    expect(gatewayFootnote(wildcardStatus())).toContain('允许局域网访问')
   })
 })

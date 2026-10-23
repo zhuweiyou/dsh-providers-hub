@@ -282,7 +282,13 @@ describe('历史视图 · RPC 响应体字段名契约', () => {
 
   it('类型声明的字段名与客户端一致（`history`，非 `days`）', () => {
     const types = readFileSync(resolve(here, '../../src/types.ts'), 'utf8')
-    const block = types.slice(types.indexOf('interface RpcUsageTokenLedgerHistoryResponse'))
+    const start = types.indexOf('interface RpcUsageTokenLedgerHistoryResponse')
+    // ⚠️ **必须只截这个接口自己的块**，不能 `slice(start)` 到文件尾：那样后面任何
+    // 新增接口里出现 `days:` 都会把本用例打红（2026-10-23 给成长中心总览加
+    // `streak.days` 时实测踩到 —— 断言在测「文件剩下的部分」，不是「这个接口」）。
+    // 收紧到接口闭包**不是放宽**：`history` 与「无 days」两条断言都还在，只是
+    // 判据打在了自己声称的那个类型上。
+    const block = types.slice(start, types.indexOf('\n}', start) + 2)
     expect(block).toMatch(/^\s*history: TokenLedgerHistoryDay\[\]/m)
     expect(block).not.toMatch(/^\s*days:/m)
   })

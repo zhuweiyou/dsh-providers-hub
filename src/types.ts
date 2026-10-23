@@ -1495,6 +1495,45 @@ export interface RpcGatewayStatusResponse {
    * - `none`：两者都拿不到，目录必然为空
    */
   modelsSource: 'catalog' | 'adapters' | 'none'
+  /**
+   * 「允许局域网访问」开关的持久化状态（2026-10-23）。
+   *
+   * `false`（缺省）⇒ 网关只监听本机；`true` ⇒ 绑通配地址，同一网络内其它设备
+   * 都能访问。**与 `enabled` 是两个独立开关**：一个管「跑不跑」，一个管「谁能连」。
+   */
+  lanAccess: boolean
+  /**
+   * 局域网可达的 OpenAI 兼容基地址（`http://192.168.1.8:8326/v1`…）。
+   *
+   * ⚠️ **只在 `lanAccess` 为真且确实绑在通配地址上时才有内容**：绑 127.0.0.1 时
+   * 这些 URL 连不通，列出来等于误导用户去复制一个必然超时的地址。
+   * ⚠️ 可能为空数组（多网卡全被过滤 / 只有回环）—— 此时 UI 应显示
+   * 「未检测到局域网地址」，而不是让用户猜。
+   */
+  lanUrls: string[]
+}
+
+/** RPC: 切换「允许局域网访问」（写操作，会**重建监听**：Node 不能原地换绑地址）。 */
+export interface RpcGatewaySetLanAccessRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 切换局域网访问的响应（**窄响应**，刻意不回整份状态）。
+ *
+ * ⚠️ 为什么不复用 `RpcGatewayStatusResponse`：那份要现采**模型目录**（逐 provider
+ * 一次远端/缓存调用）。用户只是拨了一个暴露面开关，不该为此付目录采集的代价；
+ * 客户端拿这几个字段 patch 进已有状态即可。
+ */
+export interface RpcGatewaySetLanAccessResponse {
+  /** 切换后的持久化状态。 */
+  lanAccess: boolean
+  /** 切换后可达的局域网地址（仅绑通配地址且确实在监听时非空）。 */
+  lanUrls: string[]
+  /** 重建后的运行态。 */
+  running: boolean
+  /** 重建后的实际监听地址。 */
+  address: { host: string; port: number } | null
 }
 
 /** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */
@@ -2191,6 +2230,183 @@ export interface RpcBuddyGrowthAccountResult {
   tasks: RpcBuddyGrowthTaskResult[]
   /** 执行失败原因（凭据失效、任务列表查询失败等）。 */
   error?: string
+  /**
+   * 成长中心**扩展收益**（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）的逐项结果。
+   *
+   * ⚠️ 与 `tasks` **并列**而不是折进 `message`：这批动作与「任务」是两条独立
+   * 收益链（纯 RPC 发放，不需要行为事件），混进一句文案就看不出「哪一项给了多少」
+   * —— 而那正是用户问「点了做任务到底领到什么」时唯一能回答的东西。
+   *
+   * 缺字段 = 本轮未执行扩展收益（时间预算用尽 / 非 buddy / 旧版本）。
+   */
+  extras?: RpcBuddyGrowthExtras
+}
+
+/** 成长中心扩展收益的**单步**结果。 */
+export interface RpcBuddyGrowthStep {
+  /** `true` = 本次真的到账 / 推进了。 */
+  ok: boolean
+  /** 给用户看的一句话（保留上游原文）。 */
+  message: string
+  /** `true` = 结构上不适用（无猫、无补签卡、无抽奖次数…），UI 不该染红。 */
+  skipped?: boolean
+}
+
+/** 成长中心扩展收益的整体结果（字段顺序即执行顺序）。 */
+export interface RpcBuddyGrowthExtras {
+  /** 新手礼包（一次性，已领归 `skipped`）。 */
+  gift?: RpcBuddyGrowthStep & { credit?: number }
+  /** 补签（昨日漏签 + 有卡才动）。 */
+  makeup?: RpcBuddyGrowthStep
+  /** 连登档位兑换。 */
+  streak?: RpcBuddyGrowthStep & { days?: number; redeemed?: string[] }
+  /** 抽奖（按 `chances` 抽，有上限）。 */
+  lottery?: RpcBuddyGrowthStep & { chances?: number; drawn?: number }
+  /** 猫猫旅行（每日一段）。 */
+  travel?: RpcBuddyGrowthStep & { action?: string; credit?: number }
+  /** 领养首只 Buddy（+300，一次性）。 */
+  adopt?: RpcBuddyGrowthStep
+}
+
+/** RPC: 成长中心**只读总览**（面板「有地方看」的数据源，不发任何写请求）。 */
+export interface RpcBuddyGrowthOverviewRequest {
+  /** 目标 provider（目前只有 `'buddy'`）。 */
+  provider: string
+}
+
+/** 总览里的单个任务行。 */
+export interface RpcBuddyGrowthOverviewTask {
+  /** 任务码（如 `chat_5`）。 */
+  taskCode: string
+  /** 上游标题（缺省回落任务码）。 */
+  title: string
+  /** 奖励摘要（`+100 积分 +5 能量`；无奖励为空串）。 */
+  reward: string
+  /** 进度摘要（`3/5`；服务端未下发进度时为空串）。 */
+  progress: string
+  /** 上游状态原文（`not_accepted` / `in_progress` / `completed` / `claimed` …）。 */
+  status: string
+  /**
+   * 本仓库**能不能纯 API 推进**：
+   * - `api`：有完成动作（{@link RpcBuddyGrowthTaskResult} 的白名单）；
+   * - `client`：判据只在客户端行为里记录；
+   * - `unknown`：不认识的任务码（上游新增，未接线）。
+   */
+  reach: 'api' | 'client' | 'unknown'
+  /** 已达标未领取（可自动补领）。 */
+  claimable?: boolean
+}
+
+/** 总览里的单账号一行。 */
+export interface RpcBuddyGrowthOverviewAccount {
+  accountId: string
+  nickname: string
+  /** 本轮是否至少有一项读到数据（全失败时 `false`，见 `error`）。 */
+  ok: boolean
+  error?: string
+  /** 连登状态。 */
+  streak?: {
+    days: number
+    monthTotalDays: number
+    nextTierRemaining: number
+    makeupCards: number
+    makeupCardsMax: number
+    tiers: Array<{ tier: string; status: string; credit: number; chances: number }>
+  }
+  /** 抽奖状态。 */
+  lottery?: { chances: number; enabled: boolean }
+  /** 旅行状态。 */
+  travel?: { state: string; dailyLimitReached: boolean; rewardCredit: number }
+  /** 是否已有 Buddy（`false` = 还能领 +300）。 */
+  hasBuddy?: boolean
+  /** 任务清单（默认口径 + 小程序口径合并）。 */
+  tasks?: RpcBuddyGrowthOverviewTask[]
+  /** 上次「一键领积分」中该账号的扩展收益结果（持久化，见 `growth-run-log.ts`）。 */
+  lastRun?: {
+    /** 时间戳（毫秒）。 */
+    at: number
+    /** 一句话摘要。 */
+    summary: string
+    extras?: RpcBuddyGrowthExtras
+  }
+}
+
+/** RPC: 成长中心只读总览响应。 */
+export interface RpcBuddyGrowthOverviewResponse {
+  accounts: RpcBuddyGrowthOverviewAccount[]
+}
+
+/**
+ * RPC: 成长任务的**实时进度**（2026-10-23，纯内存、零上游请求）。
+ *
+ * 用户报障：「看不到任务执行进度，至少也要给到一个状态行，告知当前哪个号正在做什么
+ * 任务」。一键领取是一次 RPC 跑几分钟，面板只能轮询宿主侧进度表
+ * （`src/growth-progress.ts`）——本端点就是那个只读窗口。
+ *
+ * ⚠️ **为什么不能用 `buddy.growthOverview` 代替**：那个端点每个账号要打 6 个上游
+ * 请求，用它轮询等于对上游做 DDoS。本端点只读进程内单例，可以每 2s 一次。
+ */
+export interface RpcBuddyGrowthProgressRequest {
+  provider: string
+}
+
+/** 当前正在执行的**一步**。 */
+export interface RpcBuddyGrowthProgressStep {
+  accountId: string
+  nickname: string
+  /** 人类可读，如 `任务 chat_5：发一条对话`、`猫猫旅行`。 */
+  text: string
+  /** 该步骤开始时刻（毫秒）。 */
+  at: number
+}
+
+/** 一轮执行的状态快照。 */
+export interface RpcBuddyGrowthProgressState {
+  /** 本轮唯一 id（前端可据此判断「是不是新的一轮」）。 */
+  runId: string
+  startedAt: number
+  /** 是否仍在执行。⚠️ 它在**宿主进程**里跑 —— 面板切走不会中断。 */
+  running: boolean
+  totalAccounts: number
+  doneAccounts: number
+  /** 当前步骤（`running:false` 时保留最后一次，便于「刚才做了什么」）。 */
+  current?: RpcBuddyGrowthProgressStep
+  finishedAt?: number
+  /** 结束摘要。 */
+  summary?: string
+  /** 整轮异常（护栏兜底）。 */
+  error?: string
+}
+
+/** RPC: 进度响应（没有跑过任何一轮时 `run` 缺省）。 */
+export interface RpcBuddyGrowthProgressResponse {
+  run?: RpcBuddyGrowthProgressState
+}
+
+/**
+ * RPC: **上次执行结果**（零上游请求，只读磁盘上的 `growth-runs.json`）。
+ *
+ * 为什么要单独一条：总览（`buddy.growthOverview`）每个账号要打 6 个上游请求
+ * （2026-10-23 用户报障：「打开插件面板就读取，这样每次都要向上游发 API 请求太多了」）。
+ * ⇒ 打开面板只读这份**本地**记录 + 进度，**任务清单改为点按钮才读**。
+ */
+export interface RpcBuddyGrowthLastRunsRequest {
+  provider: string
+}
+
+/** 单账号的最近一次执行记录（`nickname` 由账号池补，日志里不存）。 */
+export interface RpcBuddyGrowthLastRun {
+  accountId: string
+  nickname?: string
+  at: number
+  summary: string
+  /** 逐项扩展收益结果（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。 */
+  extras?: RpcBuddyGrowthExtras
+}
+
+/** RPC: 上次执行结果响应。 */
+export interface RpcBuddyGrowthLastRunsResponse {
+  runs: RpcBuddyGrowthLastRun[]
 }
 /** RPC: 成长中心任务一键全自动化响应 */
 export interface RpcBuddyGrowthTasksResponse {

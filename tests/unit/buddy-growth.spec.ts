@@ -6,6 +6,7 @@ import {
   AUTOMATABLE_TASK_CODES,
   GROWTH_TASK_COMPLETION,
   GROWTH_TASKS_PATHS,
+  MP_TASK_CODES,
   claimAllGrowth,
   claimGrowthTaskReward,
   fetchGrowthTaskCodes,
@@ -211,9 +212,26 @@ describe('任务映射表的自洽性', () => {
   })
 
   it('spec 里出现的码都在白名单里', () => {
-    const known = new Set([...AUTOMATABLE_TASK_CODES, 'first_buddy'])
+    // ⚠️ 白名单有**两张**：web 口径的 `AUTOMATABLE_TASK_CODES` 与小程序口径的
+    // `MP_TASK_CODES`（2026-10-23 起）。判据是「这个码会被 accept 到」——
+    // `fetchGrowthTaskCodes` 正是 `AUTOMATABLE.has || MP.has`，两边都不在的码
+    // 永远进不了待办，spec 写了也是死代码（本用例抓的就是这种孤儿）。
+    const known = new Set([...AUTOMATABLE_TASK_CODES, ...MP_TASK_CODES, 'first_buddy'])
     const orphan = Object.keys(GROWTH_TASK_COMPLETION).filter((code) => !known.has(code))
     expect(orphan).toEqual([])
+  })
+
+  it('小程序专属任务只在小程序口径下发：码表与 spec 必须成对登记', () => {
+    // 只加码不加 spec ⇒ 会被 accept 但永远没有完成动作（静默）；只加 spec 不加码
+    // ⇒ 永远进不了待办（同样静默）。两者都必须成对，否则「任务全部弄过来」是假的。
+    for (const code of MP_TASK_CODES) {
+      expect(GROWTH_TASK_COMPLETION[code], `${code} 缺 spec`).toBeDefined()
+    }
+    // 反向：mp spec 的码必须都在 MP_TASK_CODES 里（否则会被 web 口径的 accept 发出去）
+    for (const [code, spec] of Object.entries(GROWTH_TASK_COMPLETION)) {
+      if (spec.kind !== 'mpChat' && spec.kind !== 'mpExpert' && spec.kind !== 'mpEvent') continue
+      expect(MP_TASK_CODES.has(code), `${code} 用了 mp kind 却不在 MP_TASK_CODES`).toBe(true)
+    }
   })
 
   it('需要客户端或时间窗口的任务仍在白名单里', () => {

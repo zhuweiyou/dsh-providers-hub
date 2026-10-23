@@ -22,6 +22,19 @@ import type {
   Context } from '@deepseek-ai/cordis'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
+import {
+  beginGrowthRun,
+  completeGrowthAccount,
+  finishGrowthRun,
+  readGrowthProgress,
+  reportGrowthStep,
+  growthRunActive,
+} from './growth-progress.js'
+import {
+  fetchGrowthCenterSnapshot,
+  listAllGrowthTasks,
+} from './buddy-growth-center.js'
+import { growthRunOf, readGrowthRunLog } from './growth-run-log.js'
 import type { BuddyCredential } from './buddy.js'
 import { CODEBUDDY, WORKBUDDY, productById } from './product.js'
 import { claimCompensation,
@@ -36,7 +49,8 @@ import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite,
   type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { isGatewayEnabled } from './openai-gateway/config.js'
+import { isGatewayEnabled, isWildcardHost } from './openai-gateway/config.js'
+import { lanGatewayUrls } from './openai-gateway/lan.js'
 import { collectGatewayEffortViews,
   collectGatewayModels,
   toGatewayModelIds,
@@ -46,6 +60,7 @@ import {
   gatewayAddress,
   gatewayApiKey,
   isGatewayRunning,
+  restartGatewayRuntime,
   setGatewayDesiredEnabled,
   } from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
@@ -55,6 +70,13 @@ import type { CodeArtsCredential,
   RpcBuddyCompensationStatusResponse,
   RpcBuddyClaimCompensationRequest,
   RpcBuddyClaimCompensationResponse,
+  RpcBuddyGrowthOverviewAccount,
+  RpcBuddyGrowthLastRunsRequest,
+  RpcBuddyGrowthLastRunsResponse,
+  RpcBuddyGrowthOverviewRequest,
+  RpcBuddyGrowthOverviewResponse,
+  RpcBuddyGrowthProgressRequest,
+  RpcBuddyGrowthProgressResponse,
 } from './types.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
@@ -325,6 +347,8 @@ import type {
   RpcProviderSetEnabledResponse,
   RpcGatewayStatusResponse,
   RpcGatewaySetEnabledRequest,
+  RpcGatewaySetLanAccessRequest,
+  RpcGatewaySetLanAccessResponse,
   RpcMinimaxXffRequest,
   RpcMinimaxXffResponse,
   RpcNativeSearchGetEnabledResponse,
@@ -797,6 +821,14 @@ export interface CreditsEndpointDeps<
      * 无来由的失败。
      */
     roundDeadlineAt: number | undefined,
+    /**
+     * 进度回调（可选）：实现方每做一个动作就叫一次，用于面板的「状态行」。
+     *
+     * ⚠️ 骨架在调用前已把「当前账号 / 第几个 / 总数」写进宿主侧进度表
+     * （`src/growth-progress.ts`），实现方**只需**报「这个账号里在做什么」。
+     * ⚠️ 只有 `afterClaim` 存在（也就是有成长中心的渠道）时才会被传。
+     */
+    report?: (step: string) => void,
   ) => Promise<unknown>
   /**
    * 签到收尾的**附加提示**（可选；对 `claimed` 与 `already-claimed` **都会跑**）。
@@ -826,6 +858,14 @@ export interface CreditsEndpointDeps<
     entry: ProviderAccountEntry,
     outcome: ClaimOutcome,
   ) => Promise<string | undefined>
+  /**
+   * 进度表槽位（可选）：给了就在本趟循环里维护「当前账号 / 第几个」，
+   * 面板通过 `buddy.growthProgress` 轮询（见 `src/growth-progress.ts`）。
+   *
+   * ⚠️ 只有**有成长中心**的渠道才生效（`deps.afterClaim !== undefined`）——
+   * 否则无异于给一次几十秒的签到也挂一条进度行，那不是用户要的「进度」。
+   */
+  progressKey?: string
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -1153,90 +1193,120 @@ export async function collectClaimResults<TCredential = ChannelCredential, TProd
     : Number(deps.roundBudgetMs)
   const roundBudgetMs = Number.isFinite(rawRound) ? rawRound : 0
   const roundDeadlineAt = roundBudgetMs > 0 ? Date.now() + roundBudgetMs : undefined
-  for (const entry of accounts) {
-    let outcome: ClaimOutcome
-    try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined) {
-        outcome = { kind: 'failed', code: -1, message: '凭据未配置' }
-      } else {
-        const credential = JSON.parse(resolved.value) as TCredential
-        if (!precheck) {
-          // 领取流程自带状态判断（LobsterAI 的 slot/context 检查在 claim 内部）。
-          outcome = await claim(credential, product, entry)
+  /**
+   * 成长中心**进度表**（2026-10-23）：仅当本家有 `afterClaim`（即 `progressKey`）时开启。
+   *
+   * ⚠️ 包在 `try/finally` 里是**承重**的：一旦整轮以异常收场却没人把 `running`
+   *    置回 false，面板会**永远显示「正在执行」**并禁用按钮 —— 比没有进度更糟。
+   */
+  const progressKey = deps.afterClaim === undefined ? undefined : deps.progressKey
+  const runId = progressKey === undefined ? undefined : beginGrowthRun(progressKey, accounts.length)
+  try {
+    for (const entry of accounts) {
+      // 状态行第一格：走进这个账号就先报「签到」——后面的成长动作会覆盖它。
+      // ⚠️ 用 `nickname || accountId`：手机号/微信登录的账号 nickname 常常就是 id。
+      if (progressKey !== undefined) {
+        reportGrowthStep(progressKey, entry.id, entry.nickname || entry.id, '签到')
+      }
+      let outcome: ClaimOutcome
+      try {
+        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined) {
+          outcome = { kind: 'failed', code: -1, message: '凭据未配置' }
         } else {
-          // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
-          const status = await fetchStatus(credential, product)
-          if (status !== null && !status.active) {
-            outcome = { kind: 'inactive', message: '签到活动未开启' }
-          } else if (status !== null && status.todayCheckedIn) {
-            outcome = { kind: 'already-claimed', message: '今天已签到' }
-          } else {
-            // 状态查询失败（status 为 null）时仍然尝试领取：
-            // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
+          const credential = JSON.parse(resolved.value) as TCredential
+          if (!precheck) {
+            // 领取流程自带状态判断（LobsterAI 的 slot/context 检查在 claim 内部）。
             outcome = await claim(credential, product, entry)
-          }
-        }
-      }
-    } catch (error) {
-      deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 失败: ${String(error)}`)
-      outcome = {
-        kind: 'failed', code: -1,
-        message: error instanceof Error ? error.message : String(error),
-      }
-    }
-    outcomes.push(outcome)
-    results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
-    // ★ **签到收尾的附加提示**（2026-10-20）：本条对 `claimed` 与 `already-claimed`
-    //   **都会跑** —— 后者正是「今天已签到」的账号（本家 precheck 直接回它、
-    //   连 `claim` 都不调），而它恰恰最该抽奖。见 `afterClaimNote` 的契约说明。
-    //   ⚠️ 必须在 `results.push` **之后**改写（改的是同一对象引用）——
-    //      放到之前也行，但那时 `outcome` 还没定稿，语义容易读错。
-    if (deps.afterClaimNote !== undefined) {
-      try {
-        const resolvedForNote = await deps.resolve(credentialRef(entry.credentialRef))
-        if (resolvedForNote !== undefined) {
-          const credentialForNote = JSON.parse(resolvedForNote.value) as TCredential
-          const note = await deps.afterClaimNote(
-            credentialForNote, product, entry, outcome,
-          )
-          if (typeof note === 'string' && note.length > 0) {
-            // ⚠️ 只改**这一条** outcome 的 message（客户端渲染的就是它）。
-            //    `claimed` 结局原本没有 message 字段 ⇒ 这里补上；
-            //    `already-claimed` / `inactive` / `failed` 则是追加在原文案之后。
-            const target = results[results.length - 1]!.outcome as { message?: string }
-            target.message = typeof target.message === 'string' && target.message.length > 0
-              ? `${target.message} · ${note}`
-              : note
+          } else {
+            // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
+            const status = await fetchStatus(credential, product)
+            if (status !== null && !status.active) {
+              outcome = { kind: 'inactive', message: '签到活动未开启' }
+            } else if (status !== null && status.todayCheckedIn) {
+              outcome = { kind: 'already-claimed', message: '今天已签到' }
+            } else {
+              // 状态查询失败（status 为 null）时仍然尝试领取：
+              // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
+              outcome = await claim(credential, product, entry)
+            }
           }
         }
       } catch (error) {
-        // ⚠️ 抽奖的任何异常都不得影响签到结果（契约见 `afterClaimNote`）。
-        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 收尾提示失败: ${String(error)}`)
-      }
-    }
-    // 成长中心等「领取之后」的下钻：与签到共用这一趟循环，避免把凭据解析做两遍。
-    // 它的异常只让该项自己失败，不影响已定稿的签到 outcome。
-    if (deps.afterClaim !== undefined) {
-      try {
-        const resolvedForGrowth = await deps.resolve(credentialRef(entry.credentialRef))
-        if (resolvedForGrowth !== undefined) {
-          const credentialForGrowth = JSON.parse(resolvedForGrowth.value) as TCredential
-          const extra = await deps.afterClaim(
-            credentialForGrowth, product, entry, outcome, roundDeadlineAt,
-          )
-          if (extra !== undefined) {
-            // ⚠️ 上游把 `afterClaim` 的返回类型放宽成 `{} | null`（他们的公开仓库里
-            // 该钩子只服务 astudio 等渠道），而**本仓库**的 `afterClaim` 唯一生产入口是
-            // `provider-credits.ts` 给 buddy 挂的成长中心，返回值恒为
-            // `RpcBuddyGrowthAccountResult` ⇒ 这里按契约标注，不加运行时校验是安全的。
-            growth.push(extra as RpcBuddyGrowthAccountResult)
-          }
+        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 失败: ${String(error)}`)
+        outcome = {
+          kind: 'failed', code: -1,
+          message: error instanceof Error ? error.message : String(error),
         }
-      } catch (error) {
-        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 成长任务失败: ${String(error)}`)
       }
+      outcomes.push(outcome)
+      results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+      // ★ **签到收尾的附加提示**（2026-10-20）：本条对 `claimed` 与 `already-claimed`
+      //   **都会跑** —— 后者正是「今天已签到」的账号（本家 precheck 直接回它、
+      //   连 `claim` 都不调），而它恰恰最该抽奖。见 `afterClaimNote` 的契约说明。
+      //   ⚠️ 必须在 `results.push` **之后**改写（改的是同一对象引用）——
+      //      放到之前也行，但那时 `outcome` 还没定稿，语义容易读错。
+      if (deps.afterClaimNote !== undefined) {
+        try {
+          const resolvedForNote = await deps.resolve(credentialRef(entry.credentialRef))
+          if (resolvedForNote !== undefined) {
+            const credentialForNote = JSON.parse(resolvedForNote.value) as TCredential
+            const note = await deps.afterClaimNote(
+              credentialForNote, product, entry, outcome,
+            )
+            if (typeof note === 'string' && note.length > 0) {
+              // ⚠️ 只改**这一条** outcome 的 message（客户端渲染的就是它）。
+              //    `claimed` 结局原本没有 message 字段 ⇒ 这里补上；
+              //    `already-claimed` / `inactive` / `failed` 则是追加在原文案之后。
+              const target = results[results.length - 1]!.outcome as { message?: string }
+              target.message = typeof target.message === 'string' && target.message.length > 0
+                ? `${target.message} · ${note}`
+                : note
+            }
+          }
+        } catch (error) {
+          // ⚠️ 抽奖的任何异常都不得影响签到结果（契约见 `afterClaimNote`）。
+          deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 收尾提示失败: ${String(error)}`)
+        }
+      }
+      // 成长中心等「领取之后」的下钻：与签到共用这一趟循环，避免把凭据解析做两遍。
+      // 它的异常只让该项自己失败，不影响已定稿的签到 outcome。
+      if (deps.afterClaim !== undefined) {
+        try {
+          const resolvedForGrowth = await deps.resolve(credentialRef(entry.credentialRef))
+          if (resolvedForGrowth !== undefined) {
+            const credentialForGrowth = JSON.parse(resolvedForGrowth.value) as TCredential
+            const extra = await deps.afterClaim(
+              credentialForGrowth, product, entry, outcome, roundDeadlineAt,
+              // 进度回调：实现方每做一个动作就叫一次（`onStep` 的实现见
+              // `buddy-growth.ts` / `buddy-growth-center.ts`）。
+              progressKey === undefined
+                ? undefined
+                : (step: string) => reportGrowthStep(progressKey, entry.id, entry.nickname || entry.id, step),
+            )
+            if (extra !== undefined) {
+              // ⚠️ 上游把 `afterClaim` 的返回类型放宽成 `{} | null`（他们的公开仓库里
+              // 该钩子只服务 astudio 等渠道），而**本仓库**的 `afterClaim` 唯一生产入口是
+              // `provider-credits.ts` 给 buddy 挂的成长中心，返回值恒为
+              // `RpcBuddyGrowthAccountResult` ⇒ 这里按契约标注，不加运行时校验是安全的。
+              growth.push(extra as RpcBuddyGrowthAccountResult)
+            }
+          }
+        } catch (error) {
+          deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 成长任务失败: ${String(error)}`)
+        }
+      }
+    // 该账号跑完（无论成败）⇒ 进度分母推进一格。
+    if (progressKey !== undefined) completeGrowthAccount(progressKey)
     }
+  } catch (error) {
+    if (progressKey !== undefined) {
+      finishGrowthRun(progressKey, runId, undefined, error instanceof Error ? error.message : String(error))
+    }
+    throw error
+  }
+  if (progressKey !== undefined) {
+    finishGrowthRun(progressKey, runId, `本轮结束：${accounts.length} 个账号，领取 ${outcomes.filter((item) => item.kind === 'claimed').length} 个，成长 ${growth.length} 条明细`)
   }
   return {
     results,
@@ -1452,6 +1522,24 @@ function providerIdsOf(
   }
   const keys = Object.keys(modelAdapters ?? {})
   return keys.length > 0 ? keys.map((id) => ({ id })) : undefined
+}
+
+/**
+ * 组装网关的「暴露面」两字段（`lanAccess` + 可达的局域网 URL）。
+ *
+ * ⚠️ **两个分支共用**（`gateway.getEnabled` / `gateway.setEnabled` /
+ * `gateway.setLanAccess` 三处）：各算一遍必然漂移，而漂移的症状是
+ * 「开关显示已开、地址却是 127.0.0.1」——用户会照着抄一个连不上的地址。
+ *
+ * ⚠️ **只有真的绑在通配地址上才列 LAN URL**：绑 `127.0.0.1` 时那些 URL 连不通，
+ * 列出来等于误导。判据复用宿主的 `isWildcardHost`（不自己写正则）。
+ */
+function gatewayLanFields(
+  lanAccess: boolean,
+  address: { host: string; port: number } | null,
+): { lanAccess: boolean; lanUrls: string[] } {
+  if (address === null || !isWildcardHost(address.host)) return { lanAccess, lanUrls: [] }
+  return { lanAccess, lanUrls: lanGatewayUrls(address.port) }
 }
 
 /**
@@ -5753,6 +5841,26 @@ function registerJetHubEndpoints(
       //   auth 实例，查全局表会让测试无法注入桩、并重开「位置/时序错位」那扇门。
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
+        /**
+         * 成长任务的**宿主侧防重入**（2026-10-23）。
+         *
+         * 为什么客户端那道闸门不够：`claimInFlightRef` 是**组件级**的，切走 provider
+         * 或刷新页面就重置了，而上一轮仍在宿主里跑（一次 RPC 几分钟）。此时再点一次
+         * 会**并发跑两轮**：同一批账号被两套事件链重复上报（上游会判无效甚至回滚）、
+         * 限流风险翻倍、两份结果互相覆盖。
+         *
+         * ⚠️ 只拦 `runTasks === true`（成长中心）：纯签到那趟只有几十秒，且各渠道
+         * 自己幂等，拦它反而会让「自动签到 + 手点」互相打架。
+         */
+        if (req.runTasks === true && growthRunActive(req.provider)) {
+          return {
+            ok: false,
+            error: {
+              code: 'busy',
+              message: '上一轮成长任务仍在后台执行，请等它结束（切走面板不会中断，可在「成长任务中心」看进度）',
+            },
+          }
+        }
         const accounts = await pool.listAccounts(req.provider)
         // ⚠⚠ **领取前也要按需自愈**（issue IKKHL5，与 `credits.balances` 同一层）。
         //
@@ -5932,9 +6040,24 @@ function registerJetHubEndpoints(
           ...req.runTasks !== true || impl.afterClaim === undefined
             ? {}
             : {
-                afterClaim: (credential, _product, entry, _outcome, roundDeadlineAt) =>
-                  impl.afterClaim!(credential, entry, { budgetMs: req.budgetMs, roundDeadlineAt }, callContext),
+                afterClaim: (credential, _product, entry, _outcome, roundDeadlineAt, report) =>
+                  impl.afterClaim!(
+                    credential,
+                    entry,
+                    {
+                      budgetMs: req.budgetMs,
+                      roundDeadlineAt,
+                      ...report === undefined ? {} : { onStep: report },
+                    },
+                    callContext,
+                  ),
               },
+          // 进度表槽位（仅成长中心渠道）：骨架据此把「当前账号 / 第几个」写进
+          // `src/growth-progress.ts` 的单例，面板轮询 `buddy.growthProgress` 读它。
+          // ⚠️ 只在 `runTasks === true` 时才有意义（否则 `afterClaim` 不跑）。
+          ...req.runTasks !== true || impl.afterClaim === undefined
+            ? {}
+            : { progressKey: req.provider },
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
         return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
@@ -6540,6 +6663,188 @@ function registerJetHubEndpoints(
         //    会骗人的那一层，按既有入口清它足够。
         modelAdapters?.['aggregate']?.clearExpiryCache?.()
         return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
+      }
+
+      /**
+       * 成长任务**实时进度**（2026-10-23）：**零上游请求**，只读进程内单例。
+       *
+       * 用户报障：「看不到任务执行进度，至少也要给到一个状态行，告知当前哪个号正在
+       * 做什么任务」。客户端每 3s 轮询本方法 —— 它**不能**用 `buddy.growthOverview`
+       * 代替（那个每账号 6 个上游请求，轮询等于对上游做 DDoS）。
+       */
+      case 'buddy.growthProgress': {
+        const req = payload as RpcBuddyGrowthProgressRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const run = readGrowthProgress(CODEBUDDY.id)
+        return {
+          ok: true,
+          value: {
+            ...run === undefined
+              ? {}
+              : {
+                  run: {
+                    runId: run.runId,
+                    startedAt: run.startedAt,
+                    running: run.running,
+                    totalAccounts: run.totalAccounts,
+                    doneAccounts: run.doneAccounts,
+                    ...run.current === undefined
+                      ? {}
+                      : {
+                          current: {
+                            accountId: run.current.accountId,
+                            nickname: run.current.nickname,
+                            text: run.current.text,
+                            at: run.current.at,
+                          },
+                        },
+                    ...run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt },
+                    ...run.summary === undefined ? {} : { summary: run.summary },
+                    ...run.error === undefined ? {} : { error: run.error },
+                  },
+                },
+          } satisfies RpcBuddyGrowthProgressResponse,
+        }
+      }
+
+      /**
+       * 成长任务**上次执行结果**（2026-10-23）：**零上游请求**，只读
+       * `$DSH_HOME/jet-hub/growth-runs.json`。
+       *
+       * ⚠️ 2026-10-23 用户报障：「这个要弄个按钮点了才读取，而不是打开插件面板就读取，
+       * 这样每次都要向上游发 API 请求太多了」。⇒ 打开面板时**只**读这份本地记录
+       * （+ 进度），**任务清单改为点按钮才读**（`buddy.growthOverview`）。
+       */
+      case 'buddy.growthLastRuns': {
+        const req = payload as RpcBuddyGrowthLastRunsRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const nicknames = new Map(accounts.map((entry) => [entry.id, entry.nickname]))
+        const runs = Object.entries(readGrowthRunLog().runs)
+          .map(([accountId, entry]) => ({
+            accountId,
+            ...nicknames.has(accountId) ? { nickname: nicknames.get(accountId) } : {},
+            at: entry.at,
+            summary: entry.summary,
+            ...entry.extras === undefined ? {} : { extras: entry.extras },
+          }))
+          .sort((left, right) => right.at - left.at)
+        return { ok: true, value: { runs } satisfies RpcBuddyGrowthLastRunsResponse }
+      }
+
+      /**
+       * 成长中心**只读总览**（2026-10-23）：面板「有地方看」的数据源。
+       *
+       * ## 为什么要有这条 RPC（用户报障原文）
+       *
+       * > 「点了做任务 本仓好像没反应，是默默做的，没地方查询和展示对吗」
+       *
+       * 一键领取的结果原本只出现在**一次性 toast** 里，刷新即消失；任务清单本身
+       * 更是从来没有读出来展示过 —— 用户只能看着余额数字猜「刚才那一轮到底做了
+       * 什么」。本方法把「任务清单 + 连登/抽奖/旅行状态 + 上次执行结果」一次读全。
+       *
+       * ## 纪律
+       *
+       * - **纯只读**：只发 GET（`listGrowthTasks` / `fetchGrowthCenterSnapshot`），
+       *   不碰任何写端点，故面板可以随意刷新。
+       * - **逐账号容错**：单个账号凭据坏 / 上游 401 只让那一行报错，不整体失败
+       *   （与 `buddy.compensationStatus` 的 `scanCompensation` 同款纪律）。
+       * - **串行**：账号间不并发 —— 每个账号要打 6 个上游请求，并发会让面板刷新
+       *   撞上渠道频控（buddy 系实测有按账号的限流）。
+       */
+      case 'buddy.growthOverview': {
+        const req = payload as RpcBuddyGrowthOverviewRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const rows: RpcBuddyGrowthOverviewAccount[] = []
+        for (const account of accounts) {
+          const base = { accountId: account.id, nickname: account.nickname }
+          // 上次执行结果（持久化）与本次读数**并列**给出：前者回答「上一轮做了什么」，
+          // 后者回答「现在还差什么」—— 两者缺一，用户就得靠记忆对比。
+          const last = growthRunOf(account.id)
+          const lastRun = last === undefined
+            ? {}
+            : {
+                lastRun: {
+                  at: last.at,
+                  summary: last.summary,
+                  ...last.extras === undefined ? {} : { extras: last.extras },
+                },
+              }
+          try {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (resolved === undefined) {
+              rows.push({ ...base, ...lastRun, ok: false, error: '凭据不可用，请先重新登录该账号' })
+              continue
+            }
+            let credential: BuddyCredential
+            try {
+              credential = JSON.parse(resolved.value) as BuddyCredential
+            } catch {
+              rows.push({ ...base, ...lastRun, ok: false, error: '凭据解析失败，请重新登录该账号' })
+              continue
+            }
+            const snapshot = await fetchGrowthCenterSnapshot(credential, CODEBUDDY)
+            const tasks = await listAllGrowthTasks(credential, CODEBUDDY)
+            const ok = snapshot.ok || tasks.ok
+            const errors: string[] = []
+            if (!snapshot.ok && snapshot.message !== undefined) errors.push(snapshot.message)
+            if (!tasks.ok && tasks.message !== undefined) errors.push(tasks.message)
+            rows.push({
+              ...base,
+              ...lastRun,
+              ok,
+              ...errors.length > 0 ? { error: errors.join('；') } : {},
+              ...snapshot.streak === undefined || !snapshot.streak.ok
+                ? {}
+                : {
+                    streak: {
+                      days: snapshot.streak.days,
+                      monthTotalDays: snapshot.streak.monthTotalDays,
+                      nextTierRemaining: snapshot.streak.nextTierRemaining,
+                      makeupCards: snapshot.streak.makeupCards,
+                      makeupCardsMax: snapshot.streak.makeupCardsMax,
+                      tiers: snapshot.streak.tiers.map((tier) => ({
+                        tier: tier.tier,
+                        status: tier.status,
+                        credit: tier.credit,
+                        chances: tier.chances,
+                      })),
+                    },
+                  },
+              ...snapshot.lottery === undefined || !snapshot.lottery.ok
+                ? {}
+                : { lottery: { chances: snapshot.lottery.chances, enabled: snapshot.lottery.enabled } },
+              ...snapshot.travel === undefined || !snapshot.travel.ok
+                ? {}
+                : {
+                    travel: {
+                      state: snapshot.travel.state,
+                      dailyLimitReached: snapshot.travel.dailyLimitReached,
+                      rewardCredit: snapshot.travel.rewardCredit,
+                    },
+                  },
+              ...snapshot.buddy === undefined || !snapshot.buddy.ok
+                ? {}
+                : { hasBuddy: snapshot.buddy.hasBuddy },
+              ...tasks.ok ? { tasks: tasks.tasks } : {},
+            })
+          } catch (error) {
+            rows.push({
+              ...base,
+              ...lastRun,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
+        return { ok: true, value: { accounts: rows } satisfies RpcBuddyGrowthOverviewResponse }
       }
 
       case 'model.list': {
@@ -7704,6 +8009,8 @@ function registerJetHubEndpoints(
             })
           }, [] as RpcGatewayModel[]),
           modelsSource,
+          // 暴露面：开关与可达的局域网地址（判据见 `gatewayLanFields`）。
+          ...gatewayLanFields(pool.gatewayLanAccess(), address),
         }
         return { ok: true, value }
       }
@@ -7750,6 +8057,8 @@ function registerJetHubEndpoints(
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,
+          // 暴露面不随后者变化，但必须与 `getEnabled` **同形状**回传（三处共用同一函数）。
+          ...gatewayLanFields(pool.gatewayLanAccess(), blockedByEnv ? null : gatewayAddress() ?? null),
         }
         return { ok: true, value }
       }
@@ -7763,6 +8072,53 @@ function registerJetHubEndpoints(
       case 'nativeSearch.getEnabled': {
         const value: RpcNativeSearchGetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
         return { ok: true, value }
+      }
+
+      /**
+       * 切换「允许局域网访问」（2026-10-23）。
+       *
+       * ## 语义
+       *
+       * - 关（默认）⇒ 只监听 127.0.0.1；
+       * - 开 ⇒ 绑通配地址（`LAN_GATEWAY_HOST`），同一网络内其它设备可访问；
+       *   **仍必须带 API Key**（网关的鉴权一直在，这不是「无密码开放」）。
+       *
+       * ⚠️ **必须重建监听**：`server.listen(port, host)` 是初始化参数，Node 没有
+       * 换 host 的 API ⇒ 关旧实例 + 用新配置再起一个（`restartGatewayRuntime`）。
+       * 只改持久化不重建的话，症状是「开关显示已开、地址还是 127.0.0.1」。
+       *
+       * ⚠️ **env 优先**：若用户显式设了 `DSH_OPENAI_GATEWAY_HOST`，本开关**不会**
+       * 改写它（容器里刻意绑某个接口的部署不能被 UI 顶掉）。面板文案要说清这点。
+       *
+       * ⚠️ 回传**窄响应**（不回模型目录）：拨开关不该触发一次目录采集。
+       */
+      case 'gateway.setLanAccess': {
+        const req = payload as RpcGatewaySetLanAccessRequest
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        // 先落盘再重建：重建失败（端口冲突）不该让已写入的开关回滚成「看起来没生效」。
+        await pool.setGatewayLanAccess(req.enabled)
+        if (req.enabled) {
+          // 暴露面扩大必须留痕（事后追查「谁把网关开到局域网」的唯一线索）。
+          ctx.logger.warn(
+            '[jet-hub] 已开启「允许局域网访问」：网关将绑定全部网卡，'
+            + '同一网络内的其它设备可访问（隔离只靠 API Key）',
+          )
+        } else {
+          ctx.logger.info('[jet-hub] 已关闭「允许局域网访问」：网关只监听本机回环')
+        }
+        await restartGatewayRuntime()
+        const address = gatewayAddress() ?? null
+        return {
+          ok: true,
+          value: {
+            lanAccess: pool.gatewayLanAccess(),
+            running: isGatewayRunning(),
+            address,
+            lanUrls: gatewayLanFields(pool.gatewayLanAccess(), address).lanUrls,
+          } satisfies RpcGatewaySetLanAccessResponse,
+        }
       }
 
       case 'nativeSearch.setEnabled': {

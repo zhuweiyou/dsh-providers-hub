@@ -66,6 +66,12 @@ import {
   gatewayFootnote,
   gatewaySwitchDisabled,
   gatewayToggleNotice,
+  // 「允许局域网访问」开关（2026-10-23）。
+  gatewayBindLabel,
+  gatewayLanOverrideHint,
+  gatewayLanSwitchHint,
+  gatewayLanToggleNotice,
+  gatewayLanUrls,
   modelCapabilityBadge,
 } from './openai-gateway-panel.js';
 import {
@@ -174,6 +180,28 @@ import {
   compensationHeadline,
   compensationHint,
 } from './compensation-panel-logic.js';
+import {
+  accountSummary,
+  backgroundHint,
+  extrasFailures,
+  extrasLines,
+  growthCardTitle,
+  growthTone,
+  lastRunDigest,
+  lastRunText,
+  overviewCostHint,
+  overviewIdleHint,
+  overviewLoadedHint,
+  overviewLoadingHint,
+  overviewStaleHint,
+  progressLine,
+  runOf,
+  shouldRenderGrowthCard,
+  summarizeTasks,
+  taskReachText,
+  taskStatusText,
+  tierText,
+} from './growth-center-logic.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -2819,6 +2847,35 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const compensationClaimRef = React.useRef(false);
   /**
+   * 成长任务中心（CodeBuddy 成长计划）的只读总览。
+   *
+   * 形状 `{ loading, accounts: [...], error }`；`null` = 尚未读取。
+   *
+   * ⚠️ 与补偿卡的**关键区别**：那里是「有数据才渲染」，这里是**常驻卡片** ——
+   * 用户的原始诉求就是「点了做任务没反应、没地方看」，所以即便一次都没跑过、
+   * 或上游读取失败，也要把入口与解释摆在面板上（见 `shouldRenderGrowthCard`）。
+   *
+   * 数据来自宿主 RPC `buddy.growthOverview`（纯只读：任务清单 + 连登/抽奖/旅行
+   * 状态 + **上次执行结果**（落盘，刷新不丢））。
+   */
+  const [growthCenter, setGrowthCenter] = React.useState(null);
+  /**
+   * **廉价**的成长状态：实时进度（宿主内存）+ 上次执行结果（本地磁盘）。
+   *
+   * ⚠️⚠️ 与 `growthCenter`（贵的快照）分离，是 2026-10-23 用户报障的直接产物：
+   * > 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发
+   * >  API 请求太多了」
+   *
+   * 分工：
+   * - 本状态 = `buddy.growthProgress`（零上游）+ `buddy.growthLastRuns`（零上游）；
+   *   打开面板就读、并每 3s 轮询进度；
+   * - `growthCenter` = `buddy.growthOverview`（**每账号约 6 个上游请求**）⇒
+   *   **只在用户点「读取任务清单」时**才发。
+   */
+  const [growthLive, setGrowthLive] = React.useState({ runs: [], progress: null });
+  /** 展开任务明细的账号 id 集合（默认收起：一个号 20+ 行会把面板撑爆）。 */
+  const [growthExpanded, setGrowthExpanded] = React.useState({});
+  /**
    * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
    *
    * ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同：
@@ -3221,10 +3278,76 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 读取**廉价**状态：实时进度（零上游）+ 上次执行结果（零上游）。
+   *
+   * ⚠️ 这是**打开面板就会跑**的那条腿，故它**绝不能**发上游请求：
+   * `buddy.growthProgress` 只读宿主内存，`buddy.growthLastRuns` 只读本地
+   * `growth-runs.json`。任务清单（贵）走 {@link loadGrowthCenter}，只在点按钮时跑。
+   */
+  const loadGrowthLive = React.useCallback(async () => {
+    if (!shouldRenderGrowthCard(provider)) return;
+    const [progress, runs] = await Promise.all([
+      rpcCall('buddy.growthProgress', { provider }).catch(() => null),
+      rpcCall('buddy.growthLastRuns', { provider }).catch(() => null),
+    ]);
+    if (!mounted.current) return;
+    setGrowthLive((prev) => ({
+      progress: progress && progress.run ? progress.run : null,
+      // 拉取失败时**保留**上一次的记录：本地记录不该因为一次 RPC 抖动就清空。
+      runs: runs && Array.isArray(runs.runs) ? runs.runs : prev.runs,
+    }));
+  }, [provider, rpcCall]);
+
+  /**
+   * 读取**任务清单总览**（`buddy.growthOverview`，**贵**：每账号约 6 个上游请求）。
+   *
+   * ⚠️ 2026-10-23 用户报障后改为**只由按钮触发**，不再随面板挂载自动跑：
+   * > 「这个要弄个按钮点了才读取，而不是打开插件面板就读取，这样每次都要向上游发
+   * >  API 请求太多了」
+   *
+   * ⚠️ 失败**只让卡片染黄**，不掀掉面板。
+   * ⚠️ 非 buddy 直接返回，连 RPC 都不发。
+   */
+  const loadGrowthCenter = React.useCallback(async () => {
+    if (!shouldRenderGrowthCard(provider)) return;
+    setGrowthCenter((prev) => ({ ...(prev || {}), loading: true, error: null }));
+    try {
+      const res = await rpcCall('buddy.growthOverview', { provider });
+      if (!mounted.current) return;
+      const accounts = Array.isArray(res?.accounts) ? res.accounts : [];
+      setGrowthCenter({ loading: false, accounts, error: null, loadedAt: Date.now(), stale: false });
+    } catch (caught) {
+      console.error('[jet-hub] growth overview failed:', caught);
+      if (!mounted.current) return;
+      setGrowthCenter({
+        loading: false,
+        accounts: [],
+        error: (caught && caught.message) || '成长任务中心读取失败',
+      });
+    }
+  }, [provider, rpcCall]);
+
+  /**
+   * 进度轮询（每 3s）：**只打 `buddy.growthProgress`**（宿主内存，零上游）。
+   *
+   * ⚠️ 为什么即便本地 `claiming === false` 也要轮询：一轮可能由**另一个面板**
+   * （或切走前的本面板）在宿主里跑着，回来时必须以宿主为准 —— 否则会出现
+   * 「宿主在跑、按钮却是可点的」⇒ 点下去撞 `busy` 错误。
+   * ⚠️ 卸载/切 provider 必须清定时器（否则会一直打 RPC）。
+   */
+  React.useEffect(() => {
+    if (!shouldRenderGrowthCard(provider)) return undefined;
+    const timer = setInterval(() => { void loadGrowthLive(); }, 3000);
+    return () => { clearInterval(timer); };
+  }, [provider, loadGrowthLive]);
+
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
     void loadCompensation();
+    // ⚠️ **只读本地**（进度 + 上次执行）；任务清单改为点按钮才读（见 loadGrowthCenter）。
+    void loadGrowthLive();
     // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
     // 门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
@@ -3484,6 +3607,8 @@ function ProviderPanel({ provider, rpcCall }) {
       // - 仍**逐项列出**有产出或有失败的账号：那是「哪一项为什么没涨」的唯一线索。
       let growthFailed = 0;
       let growthTimedOut = false;
+      /** 扩展收益（兑换/抽奖/旅行…）里的失败项数 —— 与「任务失败」分开计数。 */
+      let extrasFailed = 0;
       if (Array.isArray(growth) && growth.length > 0) {
         let completed = 0;
         let clientOnly = 0;
@@ -3497,6 +3622,18 @@ function ProviderPanel({ provider, rpcCall }) {
           claimedCount += account.claimedCount || 0;
           claimedCredit += account.claimedCredit || 0;
           if (account.timedOut) growthTimedOut = true;
+          /**
+           * 成长中心**扩展收益**（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。
+           *
+           * ⚠️ 必须在下面两处 `continue` **之前**处理：那些分支（凭据失效、本轮
+           * 零产出）恰恰最需要看到「扩展收益到底给了什么」—— 例如任务全做完的号
+           * 零产出，但当天可能刚兑换了 28d 档位并抽了 3 次奖。
+           */
+          const extraLines = extrasLines(account.extras);
+          const extraBad = extrasFailures(account.extras);
+          extrasFailed += extraBad.length;
+          for (const line of extraLines) details.push(`　· ${who}：${line}`);
+          for (const line of extraBad) details.push(`　· ${who}：扩展收益失败 — ${line}`);
           if (account.error) {
             details.push(`${who}：${account.error}`);
             continue;
@@ -3531,9 +3668,10 @@ function ProviderPanel({ provider, rpcCall }) {
         if (growthFailed > 0) parts.push(`成长失败 ${growthFailed} 项`);
         if (claimedCount > 0) parts.push(`自动领取 ${claimedCount} 项（+${claimedCredit} 积分）`);
         if (growthTimedOut) parts.push('本轮时间预算用尽，剩余项未执行，再点一次即可继续');
+        if (extrasFailed > 0) parts.push(`扩展收益失败 ${extrasFailed} 项`);
       }
       setClaimNotice({
-        tone: summary.failed > 0 || growthFailed > 0 ? 'warn' : 'ok',
+        tone: summary.failed > 0 || growthFailed > 0 || extrasFailed > 0 ? 'warn' : 'ok',
         text: parts.length > 0 ? parts.join('，') : '没有可领取的账号',
         details,
       });
@@ -3543,6 +3681,11 @@ function ProviderPanel({ provider, rpcCall }) {
       //   缓存（120s TTL），不绕过的话这里会把**领取前**的读数重新显示出来 ——
       //   正是本行注释想避免的现象，只是换了个成因（审计实测确认）。
       await loadCredits(true);
+      // 「有地方看」的承重腿：领取结束后只重读**本地**那两份（进度 + 上次执行），
+      // 不重读任务清单 —— 那要每账号 6 个上游请求，用户明确要求「点了才读」。
+      // 已读过的快照据此标 `stale`，卡片会提示「这是执行前的快照」。
+      setGrowthCenter((prev) => (prev === null ? prev : { ...prev, stale: true }));
+      await loadGrowthLive();
     } catch (caught) {
       console.error('[jet-hub] claim credits failed:', caught);
       if (!mounted.current) return;
@@ -4143,6 +4286,140 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
+   * 成长任务中心卡片（**常驻**，仅 buddy）。
+   *
+   * ## 这张卡回答什么
+   *
+   * 用户的原始诉求：「点了做任务 本仓好像没反应，是默默做的，没地方查询和展示对吗，
+   * 我希望能有地方看到」。所以这张卡必须**同时**给出三件事：
+   *
+   * 1. **上次执行结果**（`lastRun`，宿主落盘在 `growth-logs/growth-runs.json`，
+   *    刷新/重启都不丢）—— 回答「刚才那一轮有没有生效」；
+   * 2. **现在的状态**（连登天数 / 补签卡 / 抽奖次数 / 旅行状态 / 是否已领养 /
+   *    任务已领比例）—— 回答「还差什么」；
+   * 3. **可展开的任务清单**（默认收起，一个号 20+ 行会撑爆面板）—— 回答
+   *    「还有哪些任务、哪些我能自动做」。
+   *
+   * ## 纪律
+   *
+   * ⚠️ 文案一律走纯函数（`growth-center-logic.js`），不在 JSX 里写三元 ——
+   *    组件不渲染 ⇒ 内联文案零覆盖（`compensation-panel-logic.js` 记过这个 P0）。
+   * ⚠️ 只对 buddy 渲染（AGENTS.md：通用面板里的按钮必须按 provider 分支）。
+   *    workbuddy 国际版**没有成长中心**（后端无任务列表），调了只会 404。
+   */
+  /** 进度 / 上次执行（**零上游**，每 3s 由 `loadGrowthLive` 轮询）。 */
+  const growthProgress = growthLive?.progress || null;
+  const growthRuns = Array.isArray(growthLive?.runs) ? growthLive.runs : [];
+  const growthRunning = growthProgress?.running === true;
+  const growthCard = shouldRenderGrowthCard(provider)
+    ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': growthRunning ? 'ok' : growthTone(growthCenter),
+        'data-testid': 'growth-center-card',
+      },
+      React.createElement('div', null, growthCardTitle({
+        overview: growthCenter,
+        progress: growthProgress,
+        accountCount: accounts.length,
+      })),
+      // ── 状态行（用户明确要求）：「当前哪个号正在做什么任务」 ──
+      React.createElement('div', {
+        className: 'dim-jh-hint',
+        'data-testid': 'growth-status-line',
+        style: { fontWeight: growthRunning ? 600 : 400 },
+      }, growthRunning
+        ? `⏳ ${progressLine(growthProgress)}`
+        : (progressLine(growthProgress) || lastRunDigest(growthRuns))),
+      // ── 后台语义（用户明确要求「要在画面说明出来」）──
+      React.createElement('div', { className: 'dim-jh-hint' }, backgroundHint()),
+      React.createElement('div', { className: 'dim-jh-headerActions' },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          type: 'button',
+          disabled: growthCenter?.loading === true,
+          title: '只读读取：任务清单 + 连登/抽奖/旅行状态。'
+            + '⚠️ 每个账号约 6 个上游请求，故只在点它时才发（打开面板不会自动读）。',
+          onClick: () => void loadGrowthCenter(),
+        }, growthCenter?.loading === true ? '读取中…' : '读取任务清单'),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          type: 'button',
+          // ⚠️ 闸门读**宿主**进度，不只读本地 `claiming`：切走再回来时本地早已
+          //   重置，而宿主那轮可能还在跑（点下去会撞 busy）。
+          disabled: claiming === true || growthRunning || !supportsCredits,
+          title: '跑一轮成长任务 + 扩展收益（连登兑换 / 抽奖 / 旅行 / 礼包 / 补签 / 领养）。'
+            + '单账号可能数分钟；执行在宿主进程里，切走不会中断。',
+          onClick: () => void claimCredits(),
+        }, claiming === true || growthRunning ? '执行中…' : '一键领取 + 成长任务'),
+      ),
+      React.createElement('div', { className: 'dim-jh-hint' },
+        growthCenter?.loading === true ? overviewLoadingHint(accounts.length) : overviewCostHint(accounts.length)),
+      // ── 任务清单（仅「读过」之后才有；未读时明确说「要手动读」而不是挂一个转圈）──
+      growthCenter === null
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewIdleHint())
+        : null,
+      growthCenter !== null && growthCenter.error
+        ? React.createElement('div', { className: 'dim-jh-hint' }, `读取失败：${growthCenter.error}`)
+        : null,
+      growthCenter !== null && !growthCenter.error
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewLoadedHint(growthCenter.loadedAt))
+        : null,
+      growthCenter?.stale === true
+        ? React.createElement('div', { className: 'dim-jh-hint' }, overviewStaleHint())
+        : null,
+      // ── 逐账号明细 ──
+      ...(Array.isArray(growthCenter?.accounts) ? growthCenter.accounts : []).map((account) => {
+        const id = account?.accountId || '';
+        const summary = accountSummary(account);
+        // 上次执行优先取**本地日志**（执行后立刻就有），退到总览里那份（读过时才有）。
+        const lastRun = runOf(growthRuns, id) || lastRunText(account?.lastRun);
+        const tasks = Array.isArray(account?.tasks) ? account.tasks : [];
+        const counts = summarizeTasks(tasks);
+        const expanded = growthExpanded[id] === true;
+        return React.createElement('div', {
+          key: id,
+          className: 'dim-jh-hint',
+          style: { marginTop: '6px' },
+        },
+        React.createElement('div', { style: { fontWeight: 600 } },
+          `${account?.nickname || id}${summary.length > 0 ? `：${summary}` : ''}`),
+        account?.error
+          ? React.createElement('div', null, `读取失败：${account.error}`)
+          : null,
+        lastRun.length > 0 ? React.createElement('div', null, `上次执行 ${lastRun}`) : null,
+        // 连登档位（一行，逗号分隔）
+        Array.isArray(account?.streak?.tiers) && account.streak.tiers.length > 0
+          ? React.createElement('div', null,
+              `连登档位：${account.streak.tiers.map(tierText).filter((text) => text.length > 0).join('，')}`)
+          : null,
+        tasks.length > 0
+          ? React.createElement('div', null,
+              React.createElement('button', {
+                className: 'dim-jh-btn',
+                type: 'button',
+                onClick: () => setGrowthExpanded((prev) => ({ ...prev, [id]: !expanded })),
+              }, `${expanded ? '收起' : '展开'}任务（${counts.total} 项：可自动 ${counts.api}`
+                + `${counts.client > 0 ? ` · 需客户端 ${counts.client}` : ''}`
+                + `${counts.claimable > 0 ? ` · 待领取 ${counts.claimable}` : ''}`
+                + ` · 已领 ${counts.claimed}）`))
+          : null,
+        expanded
+          ? React.createElement('div', { style: { marginTop: '4px' } },
+              ...tasks.map((task) => React.createElement('div', {
+                key: `${id}:${task?.taskCode || ''}`,
+                style: { paddingLeft: '8px' },
+              }, `${task?.title || task?.taskCode || '未知任务'}`
+                + `${task?.reward ? ` · ${task.reward}` : ''}`
+                + `${task?.progress ? ` · ${task.progress}` : ''}`
+                + ` · ${taskStatusText(task?.status)}`
+                + ` · ${taskReachText(task?.reach)}`)))
+          : null,
+        );
+      }),
+    )
+    : null;
+
+  /**
    * CodeBuddy 限时补偿积分卡片（仅 buddy 且已查询到状态时渲染）。
    *
    * ⚠️ **抽成变量而不是内联在 section(...) 的参数表里**：内联时它嵌在三元中，
@@ -4716,6 +4993,9 @@ function ProviderPanel({ provider, rpcCall }) {
             : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
       : null,
     compensationCard,
+    // 成长任务中心**放在补偿卡之后、账号列表之前**：它是「点了做任务有没有生效」
+    // 的唯一查看入口（用户诉求），而补偿卡是一次性活动卡，读完即可收起。
+    growthCard,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'
@@ -6291,7 +6571,7 @@ function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied
  * 3. **状态全部来自宿主侧**（`gateway.getEnabled`），前端不拿 `enabled` 自行
  *    推导运行态 —— 端口冲突与 env 停用都会让两者不一致。
  */
-function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
+function GatewayPanel({ status, busy, notice, onToggle, onToggleLan, onReload, onClose }) {
   const [copied, setCopied] = React.useState(false);
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
@@ -6487,8 +6767,10 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           // 说法（与 gatewayEndpoint 返回 '' 的既有取舍同源：不编造具体地址）。
           React.createElement('code', { className: 'dim-jh-modelId' },
             status?.address
-              ? `在 ${status.address.host} 监听，供客户端调用`
-              : '在本机监听，供客户端调用')),
+              // ⚠️ 通配地址必须翻成「在所有网卡监听」（见 `gatewayBindLabel`）：
+              // 直接印 `在 0.0.0.0 监听` 会让人以为客户端要填 0.0.0.0。
+              ? `${gatewayBindLabel(status)}，供客户端调用`
+              : '只在本机监听，供客户端调用')),
         React.createElement('input', {
           type: 'checkbox',
           className: 'dim-jh-switch',
@@ -6506,6 +6788,47 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           key: `status-${index}`,
           className: 'dim-jh-modalHint dim-jh-gatewayLine',
         }, line)),
+      // ── 「允许局域网访问」开关（2026-10-23）──
+      //
+      // 用户诉求：「画面和逻辑都只绑定了 127.0.0.1，希望加个开关支持局域网调用，
+      // 默认不开启」。它与上面那个「启用网关」是**两个独立开关**：
+      //   启用 = 跑不跑；本开关 = 谁能连。
+      //
+      // ⚠️ 打开会**重建监听**（Node 不能原地换绑地址），故与主开关共用一个 busy。
+      React.createElement('div', {
+        className: 'dim-jh-gatewaySection',
+        style: { marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(127,127,127,0.18)' },
+      },
+      React.createElement('label', { className: 'dim-jh-modelRow' },
+        React.createElement('span', { className: 'dim-jh-modelInfo' },
+          React.createElement('strong', { className: 'dim-jh-modelName' }, '允许局域网访问'),
+          React.createElement('code', { className: 'dim-jh-modelId' },
+            status?.lanAccess === true ? '已在全部网卡监听' : '仅本机 127.0.0.1')),
+        React.createElement('input', {
+          type: 'checkbox',
+          className: 'dim-jh-switch',
+          role: 'switch',
+          checked: status?.lanAccess === true,
+          // 网关被 env 停用时同样禁用：此时拨它不会产生任何监听变化。
+          disabled: disabled || busy,
+          'aria-label': `${status?.lanAccess === true ? '关闭' : '开启'}局域网访问`,
+          onChange: () => void onToggleLan(status?.lanAccess !== true),
+        })),
+      React.createElement('p', { className: 'dim-jh-modalHint dim-jh-gatewayLine' },
+        gatewayLanSwitchHint(status)),
+      // 环境变量覆盖（有才显示）：否则用户会以为「开关点了没生效」。
+      gatewayLanOverrideHint(status) !== ''
+        ? React.createElement('p', { className: 'dim-jh-modalHint dim-jh-gatewayLine' },
+            gatewayLanOverrideHint(status))
+        : null,
+      // 可达的局域网地址：逐条列出，每条都能直接抄进客户端。
+      ...gatewayLanUrls(status).map((url, index) =>
+        React.createElement('p', {
+          key: `lan-${index}`,
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        },
+        React.createElement('code', { className: 'dim-jh-modelId' }, url))),
+      ),
       // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
       // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
       // 明文供手动选中 —— 绝不能变成「点了没反应」。
@@ -7661,6 +7984,47 @@ export function JetHubPage({ rpcCall }) {
   }, [rpcCall, loadGatewayStatus]);
 
   /**
+   * 切换**允许局域网访问**（2026-10-23）。
+   *
+   * ⚠️ 宿主会**重建监听**（Node 不能原地换绑地址），故：
+   * - 与主开关共用 `gatewayBusy`（重建期间再拨另一个开关会拿到中间态）；
+   * - 回传的是**窄响应**（`gateway.setLanAccess` 刻意不回模型目录）⇒ 这里
+   *   **patch 进已有状态**，而不是重拉整份 `gateway.getEnabled`（那份要采目录）。
+   *
+   * ⚠️ **不做乐观更新**：重建可能因端口占用失败，开关必须反映真实运行态。
+   */
+  const toggleGatewayLan = React.useCallback(async (nextEnabled) => {
+    setGatewayBusy(true);
+    setGatewayNotice(null);
+    try {
+      const res = await rpcCall('gateway.setLanAccess', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setGatewayStatus((prev) => (prev === null
+        ? prev
+        : {
+            ...prev,
+            lanAccess: res?.lanAccess === true,
+            lanUrls: Array.isArray(res?.lanUrls) ? res.lanUrls : [],
+            running: res?.running === true,
+            address: res?.address ?? prev.address,
+          }));
+      setGatewayNotice({
+        // 打开是一次暴露面扩大 ⇒ 用 warn 色提醒；关闭回 ok。
+        tone: nextEnabled ? 'warn' : 'ok',
+        text: gatewayLanToggleNotice(res, nextEnabled),
+      });
+    } catch (caught) {
+      console.error('[jet-hub] toggle gateway lan access failed:', caught);
+      if (!mounted.current) return;
+      setGatewayNotice({ tone: 'error', text: '操作失败：' + (caught?.message || '未知错误') });
+      // 重建可能已经发生一半 ⇒ 重新拉一次真实状态。
+      await loadGatewayStatus();
+    } finally {
+      if (mounted.current) setGatewayBusy(false);
+    }
+  }, [rpcCall, loadGatewayStatus]);
+
+  /**
    * 读取全部供应商的汇总状态。
    *
    * 一次请求拿全部 8 个（而不是逐个查）：服务端全程只用同步内存副本，
@@ -8355,6 +8719,7 @@ export function JetHubPage({ rpcCall }) {
           busy: gatewayBusy,
           notice: gatewayNotice,
           onToggle: toggleGateway,
+          onToggleLan: toggleGatewayLan,
           onReload: loadGatewayStatus,
           onClose: () => setShowGateway(false),
         })
